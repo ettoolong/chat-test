@@ -1,7 +1,7 @@
 import crypto from "node:crypto";
-import { LlamaChatSession } from "node-llama-cpp";
+import { LlamaChatSession, Gemma4ChatWrapper } from "node-llama-cpp";
 import { config } from "./config.js";
-import { getContext, getSystemPrompt, getCacheFilePath } from "./engine.js";
+import { getContext, getSystemPrompt, getCachedState } from "./engine.js";
 
 /** @type {Map<string, {session: LlamaChatSession, lastUsed: number, busy: boolean}>} */
 const sessions = new Map();
@@ -29,8 +29,21 @@ function disposeEntry(entry) {
  * it. When false, the sequence is left empty and the system prompt gets
  * evaluated from scratch on the first message - useful for A/B-comparing
  * cached vs. cold-start performance from the UI toggle.
+ *
+ * `history` (optional [{role, content}]) replays prior turns from a conversation
+ * whose backend session was lost, e.g. after a server restart. Setting it only
+ * updates this session's own tracked chat history - none of those turns are
+ * decoded yet, so the next prompt() call decodes the whole backlog (plus the
+ * new message) in one shot before generating. The system-prompt cache still
+ * applies on top of that, since it covers the sequence's KV state independently.
+ *
+ * `thinking` picks which of the two pre-baked system-prompt caches to load
+ * (Gemma 4's `<|think|>` prefix changes the token sequence right at the front
+ * of the system prompt, so the two modes can never share a cache). This must
+ * match whatever mode was used for any replayed `history`, since that's the
+ * mode those earlier turns were actually generated under.
  */
-export async function createSession(useCache = true) {
+export async function createSession(useCache = true, history = undefined, thinking = true) {
     const context = getContext();
 
     if (context.sequencesLeft === 0) {
@@ -47,22 +60,34 @@ export async function createSession(useCache = true) {
     const sequence = context.getSequence();
 
     if (useCache) {
-        await sequence.loadStateFromFile(getCacheFilePath(), { acceptRisk: true });
+        const { buffer, tokens } = getCachedState(thinking);
+        await sequence.loadStateFromBuffer(buffer, tokens, { acceptRisk: true });
     }
 
     const session = new LlamaChatSession({
         contextSequence: sequence,
         systemPrompt: getSystemPrompt(),
+        chatWrapper: new Gemma4ChatWrapper({ reasoning: thinking }),
         autoDisposeSequence: true,
     });
+
+    if (history && history.length > 0) {
+        const replayedItems = history.map((m) =>
+            m.role === "assistant"
+                ? { type: "model", response: [m.content] }
+                : { type: "user", text: m.content }
+        );
+        // Keep the system-prompt entry the constructor already generated, append the replay after it.
+        session.setChatHistory([...session.getChatHistory(), ...replayedItems]);
+    }
 
     const sessionId = crypto.randomUUID();
     sessions.set(sessionId, { session, lastUsed: Date.now(), busy: false, usedCache: useCache });
     console.log(
-        `[Session] Created ${sessionId} (${useCache ? "cache loaded" : "cold start, no cache"}) ` +
-        `(${sessions.size}/${config.maxSessions} sequences in use)`
+        `[Session] Created ${sessionId} (${useCache ? "cache loaded" : "cold start, no cache"}, ` +
+        `thinking=${thinking}) (${sessions.size}/${config.maxSessions} sequences in use)`
     );
-    return { sessionId, usedCache: useCache };
+    return { sessionId, usedCache: useCache, thinking };
 }
 
 export function getSession(sessionId) {

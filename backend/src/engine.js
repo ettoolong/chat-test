@@ -1,14 +1,20 @@
 import fs from "node:fs";
 import path from "node:path";
 import crypto from "node:crypto";
-import { getLlama, LlamaChatSession } from "node-llama-cpp";
+import { getLlama, LlamaChatSession, Gemma4ChatWrapper } from "node-llama-cpp";
 import { config } from "./config.js";
 
 let llama = null;
 let model = null;
 let context = null;
 let systemPrompt = "";
-let cacheStats = null; // { promptTokens, prefillMs, cacheSizeBytes, generatedAt }
+let cacheStats = null; // { thinking: {promptTokens, prefillMs, cacheSizeBytes}, noThinking: {...}, generatedAt }
+// { buffer, tokens } per thinking mode - held in RAM so createSession never re-reads it from disk
+let cachedStates = { thinking: null, noThinking: null };
+
+function modeKey(thinking) {
+    return thinking ? "thinking" : "noThinking";
+}
 
 function readSystemPrompt() {
     if (!fs.existsSync(config.systemPromptFile)) {
@@ -18,7 +24,7 @@ function readSystemPrompt() {
 }
 
 function cacheMetaFile() {
-    return `${config.systemPromptCacheFile}.meta.json`;
+    return path.join(config.cacheDir, "system-prompt.cache.meta.json");
 }
 
 function modelFileFingerprint() {
@@ -51,27 +57,27 @@ function readCacheMeta() {
 }
 
 function isCacheValid() {
-    if (!fs.existsSync(config.systemPromptCacheFile)) return false;
+    if (!fs.existsSync(config.systemPromptCacheFile(true)) || !fs.existsSync(config.systemPromptCacheFile(false)))
+        return false;
     const meta = readCacheMeta();
     return meta?.cacheKey === computeCacheKey();
 }
 
 /**
- * Prefills the (current) system prompt on a scratch sequence and persists the
- * resulting KV-cache state to disk, so future sessions can load it instead of
- * re-evaluating the system prompt from scratch.
- *
- * Requires a free sequence slot - callers that may have live sessions holding
- * all slots must dispose them first (see sessionManager.disposeAllSessions).
+ * Prefills the (current) system prompt for one thinking mode on a scratch
+ * sequence and persists the resulting KV-cache state to disk. Thinking mode
+ * changes the token sequence at the very front of the system prompt (Gemma 4's
+ * `<|think|>` prefix), so its cache can't be shared with the other mode's -
+ * each needs its own prefill and its own file.
  */
-async function generateSystemPromptCache() {
-    console.log("[KV Cache] Prefilling system prompt...");
+async function generateSystemPromptCacheForMode(thinking) {
     const start = Date.now();
 
     const sequence = context.getSequence();
     const session = new LlamaChatSession({
         contextSequence: sequence,
         systemPrompt,
+        chatWrapper: new Gemma4ChatWrapper({ reasoning: thinking }),
         autoDisposeSequence: true,
     });
 
@@ -82,21 +88,51 @@ async function generateSystemPromptCache() {
     const prefillMs = Date.now() - start;
 
     fs.mkdirSync(config.cacheDir, { recursive: true });
-    const { fileSize } = await sequence.saveStateToFile(config.systemPromptCacheFile);
-    const generatedAt = Date.now();
-    cacheStats = { promptTokens, prefillMs, cacheSizeBytes: fileSize, generatedAt };
-    fs.writeFileSync(
-        cacheMetaFile(),
-        JSON.stringify({ cacheKey: computeCacheKey(), ...cacheStats }, null, 2)
-    );
+    const { fileSize } = await sequence.saveStateToFile(config.systemPromptCacheFile(thinking));
+    cachedStates[modeKey(thinking)] = await sequence.saveStateToBuffer();
 
     session.dispose();
     console.log(
-        `[KV Cache] Prefilled ${promptTokens} tokens in ${prefillMs}ms, ` +
-        `saved state to ${config.systemPromptCacheFile} (${(fileSize / 1024 / 1024).toFixed(1)} MB)`
+        `[KV Cache] Prefilled ${promptTokens} tokens (thinking=${thinking}) in ${prefillMs}ms, ` +
+        `saved state to ${config.systemPromptCacheFile(thinking)} (${(fileSize / 1024 / 1024).toFixed(1)} MB)`
+    );
+
+    return { promptTokens, prefillMs, cacheSizeBytes: fileSize };
+}
+
+/**
+ * Prefills and persists both thinking-mode variants of the system-prompt cache.
+ *
+ * Requires two free sequence slots' worth of sequential use - callers that may
+ * have live sessions holding all slots must dispose them first (see
+ * sessionManager.disposeAllSessions).
+ */
+async function generateSystemPromptCache() {
+    console.log("[KV Cache] Prefilling system prompt (thinking on + off)...");
+    const thinking = await generateSystemPromptCacheForMode(true);
+    const noThinking = await generateSystemPromptCacheForMode(false);
+    const generatedAt = Date.now();
+
+    cacheStats = { thinking, noThinking, generatedAt };
+    fs.writeFileSync(
+        cacheMetaFile(),
+        JSON.stringify({ cacheKey: computeCacheKey(), thinking, noThinking, generatedAt }, null, 2)
     );
 
     return cacheStats;
+}
+
+/**
+ * Loads both on-disk system-prompt KV caches into RAM once, so createSession
+ * can apply either to a fresh sequence without hitting disk on every session.
+ */
+async function warmInMemoryCache() {
+    for (const thinking of [true, false]) {
+        const sequence = context.getSequence();
+        await sequence.loadStateFromFile(config.systemPromptCacheFile(thinking), { acceptRisk: true });
+        cachedStates[modeKey(thinking)] = await sequence.saveStateToBuffer();
+        sequence.dispose();
+    }
 }
 
 export async function initEngine() {
@@ -126,12 +162,8 @@ export async function initEngine() {
     } else {
         console.log("[KV Cache] Existing cache is valid and will be reused for new sessions.");
         const meta = readCacheMeta();
-        cacheStats = {
-            promptTokens: meta.promptTokens,
-            prefillMs: meta.prefillMs,
-            cacheSizeBytes: meta.cacheSizeBytes,
-            generatedAt: meta.generatedAt,
-        };
+        cacheStats = { thinking: meta.thinking, noThinking: meta.noThinking, generatedAt: meta.generatedAt };
+        await warmInMemoryCache();
     }
 }
 
@@ -163,8 +195,8 @@ export function getContext() {
     return context;
 }
 
-export function getCacheFilePath() {
-    return config.systemPromptCacheFile;
+export function getCachedState(thinking) {
+    return cachedStates[modeKey(thinking)];
 }
 
 export function getModelInfo() {

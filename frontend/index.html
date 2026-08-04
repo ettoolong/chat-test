@@ -44,13 +44,68 @@
             <label>Context Size</label>
             <div id="context-size-display" class="readonly-field">-</div>
           </div>
+        </div>
+
+        <!-- Sampling Settings -->
+        <div class="sidebar-section settings-section">
+          <h3><i data-lucide="sliders-horizontal" class="section-icon"></i> Sampling</h3>
+
+          <div class="setting-group toggle-group">
+            <label for="mirostat-toggle" title="啟用後改用 Mirostat 演算法動態調整取樣，取代 Top-k/Top-p/Min-p（Temperature 仍會套用）">
+              啟用 Mirostat
+            </label>
+            <label class="switch">
+              <input type="checkbox" id="mirostat-toggle" />
+              <span class="switch-slider"></span>
+            </label>
+          </div>
 
           <div class="setting-group">
             <div class="slider-header">
               <label for="temp-slider">Temperature</label>
-              <span id="temp-val">0.7</span>
+              <span id="temp-val">1.0</span>
             </div>
-            <input type="range" id="temp-slider" min="0" max="2" step="0.1" value="0.7" />
+            <input type="range" id="temp-slider" min="0.1" max="2" step="0.1" value="1.0" />
+          </div>
+
+          <div class="setting-group">
+            <div class="slider-header">
+              <label for="top-k-slider">Top-k</label>
+              <span id="top-k-val">0</span>
+            </div>
+            <input type="range" id="top-k-slider" min="0" max="100" step="1" value="0" />
+          </div>
+
+          <div class="setting-group">
+            <div class="slider-header">
+              <label for="top-p-slider">Top-p</label>
+              <span id="top-p-val">1.0</span>
+            </div>
+            <input type="range" id="top-p-slider" min="0" max="1" step="0.01" value="1.0" />
+          </div>
+
+          <div class="setting-group">
+            <div class="slider-header">
+              <label for="min-p-slider">Min-P</label>
+              <span id="min-p-val">0.05</span>
+            </div>
+            <input type="range" id="min-p-slider" min="0" max="1" step="0.01" value="0.05" />
+          </div>
+
+          <div class="setting-group">
+            <div class="slider-header">
+              <label for="mirostat-target-slider">Mirostat Target</label>
+              <span id="mirostat-target-val">5.0</span>
+            </div>
+            <input type="range" id="mirostat-target-slider" min="0" max="10" step="0.1" value="5.0" />
+          </div>
+
+          <div class="setting-group">
+            <div class="slider-header">
+              <label for="mirostat-lr-slider">Mirostat Learning Rate</label>
+              <span id="mirostat-lr-val">0.1</span>
+            </div>
+            <input type="range" id="mirostat-lr-slider" min="0" max="1" step="0.01" value="0.1" />
           </div>
         </div>
 
@@ -71,6 +126,19 @@
             </label>
             <label class="switch">
               <input type="checkbox" id="use-cache-toggle" checked />
+              <span class="switch-slider"></span>
+            </label>
+          </div>
+
+          <div class="setting-group toggle-group">
+            <label
+              for="thinking-mode-toggle"
+              title="Gemma 4 會在 system prompt 前面加上 &lt;|think|&gt; 觸發思考模式，這會改變 KV cache 的內容，因此兩種模式各自預烤一份 cache。對話開始後無法切換，請開新對話。"
+            >
+              Thinking Mode
+            </label>
+            <label class="switch">
+              <input type="checkbox" id="thinking-mode-toggle" checked />
               <span class="switch-slider"></span>
             </label>
           </div>

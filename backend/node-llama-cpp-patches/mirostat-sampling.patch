@@ -1,0 +1,415 @@
+diff --git a/llama/addon/AddonSampler.cpp b/llama/addon/AddonSampler.cpp
+index cfea8fa..872887d 100644
+--- a/llama/addon/AddonSampler.cpp
++++ b/llama/addon/AddonSampler.cpp
+@@ -58,6 +58,11 @@ void AddonSampler::dispose() {
+         topPSampler = nullptr;
+     }
+ 
++    if (mirostatSampler != nullptr) {
++        llama_sampler_free(mirostatSampler);
++        mirostatSampler = nullptr;
++    }
++
+     if (seedSampler != nullptr) {
+         llama_sampler_free(seedSampler);
+         seedSampler = nullptr;
+@@ -128,6 +133,15 @@ void AddonSampler::rebuildChainIfNeeded() {
+         }
+ 
+         llama_sampler_chain_add(chain, greedySampler);
++    } else if (mirostatSampler != nullptr) {
++        // mirostat picks the final token itself (like the dist/seed sampler does for the default
++        // chain below), so top-k/top-p/min-p/xtc/seed are all skipped while it's active - this
++        // matches how llama.cpp's own CLI builds its sampler chain when --mirostat is set.
++        if (temperatureSampler != nullptr) {
++            llama_sampler_chain_add(chain, temperatureSampler);
++        }
++
++        llama_sampler_chain_add(chain, mirostatSampler);
+     } else {
+         if (topKSampler != nullptr) {
+             llama_sampler_chain_add(chain, topKSampler);
+@@ -376,6 +390,50 @@ Napi::Value AddonSampler::ApplyConfig(const Napi::CallbackInfo& info) {
+         topPSampler = nullptr;
+     }
+ 
++    if (config.Has("mirostat")) {
++        auto mirostat = config.Get("mirostat").As<Napi::Number>().Int32Value();
++        auto mirostatTau = config.Has("mirostatTau")
++            ? config.Get("mirostatTau").As<Napi::Number>().FloatValue()
++            : 5.0f;
++        auto mirostatEta = config.Has("mirostatEta")
++            ? config.Get("mirostatEta").As<Napi::Number>().FloatValue()
++            : 0.1f;
++        auto mirostatSeed = config.Has("seed")
++            ? config.Get("seed").As<Napi::Number>().Uint32Value()
++            : LLAMA_DEFAULT_SEED;
++
++        if (mirostat != mirostatSampler_version || mirostatTau != mirostatSampler_tau ||
++            mirostatEta != mirostatSampler_eta || (mirostat != 0 && mirostatSampler == nullptr)
++        ) {
++            mirostatSampler_version = mirostat;
++            mirostatSampler_tau = mirostatTau;
++            mirostatSampler_eta = mirostatEta;
++            freeChain();
++
++            if (mirostatSampler != nullptr) {
++                llama_sampler_free(mirostatSampler);
++                mirostatSampler = nullptr;
++            }
++
++            if (mirostatSampler_version == 1) {
++                mirostatSampler = llama_sampler_init_mirostat(
++                    llama_vocab_n_tokens(model->vocab),
++                    mirostatSeed,
++                    mirostatSampler_tau,
++                    mirostatSampler_eta,
++                    100
++                );
++            } else if (mirostatSampler_version == 2) {
++                mirostatSampler = llama_sampler_init_mirostat_v2(mirostatSeed, mirostatSampler_tau, mirostatSampler_eta);
++            }
++        }
++    } else if (mirostatSampler != nullptr) {
++        freeChain();
++        llama_sampler_free(mirostatSampler);
++        mirostatSampler = nullptr;
++        mirostatSampler_version = 0;
++    }
++
+     if (config.Has("seed")) {
+         auto seed = config.Get("seed").As<Napi::Number>().Uint32Value();
+         if (seed != seedSampler_seed || seedSampler == nullptr) {
+diff --git a/llama/addon/AddonSampler.h b/llama/addon/AddonSampler.h
+index 77735d0..8a07607 100644
+--- a/llama/addon/AddonSampler.h
++++ b/llama/addon/AddonSampler.h
+@@ -26,6 +26,11 @@ class AddonSampler : public Napi::ObjectWrap<AddonSampler> {
+         llama_sampler * topPSampler = nullptr;
+         float topPSampler_topP = 0.0f; // Top p sampling >=1.0 = disabled
+ 
++        llama_sampler * mirostatSampler = nullptr;
++        int32_t mirostatSampler_version = 0; // 0 = disabled, 1 = mirostat, 2 = mirostat v2
++        float mirostatSampler_tau = 5.0f; // target entropy
++        float mirostatSampler_eta = 0.1f; // learning rate
++
+         llama_sampler * xtcSampler = nullptr;
+         float xtcSampler_probability = 0;
+         float xtcSampler_threshold = 0;
+diff --git a/src/bindings/AddonTypes.ts b/src/bindings/AddonTypes.ts
+index a7f317c..ea9bd63 100644
+--- a/src/bindings/AddonTypes.ts
++++ b/src/bindings/AddonTypes.ts
+@@ -227,6 +227,9 @@ export type AddonSampler = {
+         minP?: number,
+         topK?: number,
+         topP?: number,
++        mirostat?: number,
++        mirostatTau?: number,
++        mirostatEta?: number,
+         seed?: number,
+         xtcProbability?: number,
+         xtcThreshold?: number,
+diff --git a/src/evaluator/LlamaChat/LlamaChat.ts b/src/evaluator/LlamaChat/LlamaChat.ts
+index affbb32..3c3bbb7 100644
+--- a/src/evaluator/LlamaChat/LlamaChat.ts
++++ b/src/evaluator/LlamaChat/LlamaChat.ts
+@@ -236,6 +236,34 @@ export type LLamaChatGenerateResponseOptions<Functions extends ChatModelFunction
+      */
+     topP?: number,
+ 
++    /**
++     * Mirostat sampling mode: `0` to disable, `1` for Mirostat, `2` for Mirostat 2.0.
++     *
++     * When enabled, `minP`, `topK`, and `topP` are ignored - mirostat replaces them with its own
++     * feedback-controlled sampling. `temperature` is still applied beforehand.
++     *
++     * Disabled by default (`0`).
++     */
++    mirostat?: number,
++
++    /**
++     * Mirostat target entropy (tau) - the desired perplexity of the generated text.
++     *
++     * Only relevant when `mirostat` is enabled.
++     *
++     * Defaults to `5.0`.
++     */
++    mirostatTau?: number,
++
++    /**
++     * Mirostat learning rate (eta) - how quickly the algorithm responds to feedback from the generated text.
++     *
++     * Only relevant when `mirostat` is enabled.
++     *
++     * Defaults to `0.1`.
++     */
++    mirostatEta?: number,
++
+     /**
+      * Used to control the randomness of the generated text.
+      *
+@@ -619,6 +647,9 @@ export class LlamaChat {
+             minP,
+             topK,
+             topP,
++            mirostat,
++            mirostatTau,
++            mirostatEta,
+             seed,
+             xtc,
+             grammar,
+@@ -660,6 +691,9 @@ export class LlamaChat {
+                 minP,
+                 topK,
+                 topP,
++                mirostat,
++                mirostatTau,
++                mirostatEta,
+                 seed,
+                 xtc,
+                 grammar: grammar as undefined, // this is a workaround to allow passing both `functions` and `grammar`
+@@ -1711,6 +1745,9 @@ class GenerateResponseState<const Functions extends ChatModelFunctions | undefin
+     private readonly minP: LLamaChatGenerateResponseOptions<Functions>["minP"];
+     private readonly topK: LLamaChatGenerateResponseOptions<Functions>["topK"];
+     private readonly topP: LLamaChatGenerateResponseOptions<Functions>["topP"];
++    private readonly mirostat: LLamaChatGenerateResponseOptions<Functions>["mirostat"];
++    private readonly mirostatTau: LLamaChatGenerateResponseOptions<Functions>["mirostatTau"];
++    private readonly mirostatEta: LLamaChatGenerateResponseOptions<Functions>["mirostatEta"];
+     private readonly seed: LLamaChatGenerateResponseOptions<Functions>["seed"];
+     private readonly xtc: LLamaChatGenerateResponseOptions<Functions>["xtc"];
+     public readonly grammar: LLamaChatGenerateResponseOptions<Functions>["grammar"];
+@@ -1830,6 +1867,9 @@ class GenerateResponseState<const Functions extends ChatModelFunctions | undefin
+             minP,
+             topK,
+             topP,
++            mirostat,
++            mirostatTau,
++            mirostatEta,
+             seed,
+             xtc,
+             grammar,
+@@ -1867,6 +1907,9 @@ class GenerateResponseState<const Functions extends ChatModelFunctions | undefin
+         this.minP = minP;
+         this.topK = topK;
+         this.topP = topP;
++        this.mirostat = mirostat;
++        this.mirostatTau = mirostatTau;
++        this.mirostatEta = mirostatEta;
+         this.seed = seed;
+         this.xtc = xtc;
+         this.grammar = grammar;
+@@ -3253,6 +3296,9 @@ class GenerateResponseState<const Functions extends ChatModelFunctions | undefin
+             minP: this.minP,
+             topK: this.topK,
+             topP: this.topP,
++            mirostat: this.mirostat,
++            mirostatTau: this.mirostatTau,
++            mirostatEta: this.mirostatEta,
+             seed: this.seed,
+             xtc: this.xtc,
+             grammarEvaluationState: () => {
+diff --git a/src/evaluator/LlamaChatSession/LlamaChatSession.ts b/src/evaluator/LlamaChatSession/LlamaChatSession.ts
+index 6001d6b..081b82f 100644
+--- a/src/evaluator/LlamaChatSession/LlamaChatSession.ts
++++ b/src/evaluator/LlamaChatSession/LlamaChatSession.ts
+@@ -162,6 +162,34 @@ export type LLamaChatPromptOptions<Functions extends ChatSessionModelFunctions |
+      */
+     topP?: number,
+ 
++    /**
++     * Mirostat sampling mode: `0` to disable, `1` for Mirostat, `2` for Mirostat 2.0.
++     *
++     * When enabled, `minP`, `topK`, and `topP` are ignored - mirostat replaces them with its own
++     * feedback-controlled sampling. `temperature` is still applied beforehand.
++     *
++     * Disabled by default (`0`).
++     */
++    mirostat?: number,
++
++    /**
++     * Mirostat target entropy (tau) - the desired perplexity of the generated text.
++     *
++     * Only relevant when `mirostat` is enabled.
++     *
++     * Defaults to `5.0`.
++     */
++    mirostatTau?: number,
++
++    /**
++     * Mirostat learning rate (eta) - how quickly the algorithm responds to feedback from the generated text.
++     *
++     * Only relevant when `mirostat` is enabled.
++     *
++     * Defaults to `0.1`.
++     */
++    mirostatEta?: number,
++
+     /**
+      * Used to control the randomness of the generated text.
+      *
+@@ -635,6 +663,9 @@ export class LlamaChatSession {
+             minP,
+             topK,
+             topP,
++            mirostat,
++            mirostatTau,
++            mirostatEta,
+             seed,
+             xtc,
+             grammar,
+@@ -655,7 +686,7 @@ export class LlamaChatSession {
+             onFunctionCallParamsChunk: onFunctionCallParamsChunk as undefined,
+ 
+             onTextChunk, onToken, onResponseChunk, budgets, signal, stopOnAbortSignal, maxTokens,
+-            temperature, minP, topK, topP, seed, xtc,
++            temperature, minP, topK, topP, mirostat, mirostatTau, mirostatEta, seed, xtc,
+             trimWhitespaceSuffix, responsePrefix, repeatPenalty, dryRepeatPenalty, tokenBias, customStopTriggers
+         });
+ 
+@@ -682,6 +713,9 @@ export class LlamaChatSession {
+         minP,
+         topK,
+         topP,
++        mirostat,
++        mirostatTau,
++        mirostatEta,
+         seed,
+         xtc,
+         grammar,
+@@ -789,6 +823,9 @@ export class LlamaChatSession {
+                         minP,
+                         topK,
+                         topP,
++                        mirostat,
++                        mirostatTau,
++                        mirostatEta,
+                         seed,
+                         xtc,
+                         tokenBias,
+diff --git a/src/evaluator/LlamaContext/LlamaContext.ts b/src/evaluator/LlamaContext/LlamaContext.ts
+index f3b2ecd..cbf6d26 100644
+--- a/src/evaluator/LlamaContext/LlamaContext.ts
++++ b/src/evaluator/LlamaContext/LlamaContext.ts
+@@ -1537,6 +1537,9 @@ export class LlamaContextSequence {
+             minP = 0,
+             topK = 40,
+             topP = 0.95,
++            mirostat = 0,
++            mirostatTau = 5.0,
++            mirostatEta = 0.1,
+             seed,
+             xtc,
+             grammarEvaluationState,
+@@ -1579,6 +1582,9 @@ export class LlamaContextSequence {
+             minP,
+             topK,
+             topP,
++            mirostat,
++            mirostatTau,
++            mirostatEta,
+             seed,
+             xtc,
+             grammarEvaluationState,
+@@ -2122,6 +2128,9 @@ export class LlamaContextSequence {
+         minP,
+         topK,
+         topP,
++        mirostat,
++        mirostatTau,
++        mirostatEta,
+         seed,
+         xtc,
+         grammarEvaluationState,
+@@ -2136,7 +2145,9 @@ export class LlamaContextSequence {
+         _noSampling = false,
+         _skipLock = false
+     }: {
+-        temperature?: number, minP?: number, topK?: number, topP?: number, seed?: number, xtc?: SequenceEvaluateOptions["xtc"],
++        temperature?: number, minP?: number, topK?: number, topP?: number,
++        mirostat?: number, mirostatTau?: number, mirostatEta?: number,
++        seed?: number, xtc?: SequenceEvaluateOptions["xtc"],
+         grammarEvaluationState?: LlamaGrammarEvaluationState | (() => LlamaGrammarEvaluationState | undefined),
+         repeatPenalty?: LlamaContextSequenceRepeatPenalty, dryRepeatPenalty?: LlamaContextSequenceDryRepeatPenalty,
+         tokenBias?: TokenBias | (() => TokenBias),
+@@ -2189,6 +2200,9 @@ export class LlamaContextSequence {
+                                 minP,
+                                 topK,
+                                 topP,
++                                mirostat,
++                                mirostatTau,
++                                mirostatEta,
+                                 seed,
+                                 xtc,
+                                 grammarEvaluationState,
+@@ -2572,6 +2586,9 @@ export class LlamaContextSequence {
+         minP = 0,
+         topK = 40,
+         topP = 0.95,
++        mirostat = 0,
++        mirostatTau = 5.0,
++        mirostatEta = 0.1,
+         seed,
+         xtc,
+         grammarEvaluationState,
+@@ -2579,7 +2596,9 @@ export class LlamaContextSequence {
+         dryRepeatPenalty,
+         tokenBias
+     }: {
+-        temperature?: number, minP?: number, topK?: number, topP?: number, seed?: number, xtc?: SequenceEvaluateOptions["xtc"],
++        temperature?: number, minP?: number, topK?: number, topP?: number,
++        mirostat?: number, mirostatTau?: number, mirostatEta?: number,
++        seed?: number, xtc?: SequenceEvaluateOptions["xtc"],
+         grammarEvaluationState?: LlamaGrammarEvaluationState | (() => LlamaGrammarEvaluationState | undefined),
+         repeatPenalty?: LlamaContextSequenceRepeatPenalty, dryRepeatPenalty?: LlamaContextSequenceDryRepeatPenalty,
+         tokenBias?: TokenBias | (() => TokenBias)
+@@ -2607,6 +2626,9 @@ export class LlamaContextSequence {
+             minP,
+             topK,
+             topP,
++            mirostat,
++            mirostatTau,
++            mirostatEta,
+             seed: Math.max(
+                 0,
+                 Number.isFinite(seed)
+diff --git a/src/evaluator/LlamaContext/types.ts b/src/evaluator/LlamaContext/types.ts
+index 23480cf..8d5ddb7 100644
+--- a/src/evaluator/LlamaContext/types.ts
++++ b/src/evaluator/LlamaContext/types.ts
+@@ -378,6 +378,34 @@ export type ContextTokensDeleteRange = {
+ export type SequenceEvaluateOptions = {
+     temperature?: number, minP?: number, topK?: number, topP?: number,
+ 
++    /**
++     * Mirostat sampling mode: `0` to disable, `1` for Mirostat, `2` for Mirostat 2.0.
++     *
++     * When enabled, `minP`, `topK`, and `topP` are ignored - mirostat replaces them with its own
++     * feedback-controlled sampling. `temperature` is still applied beforehand.
++     *
++     * Disabled by default (`0`).
++     */
++    mirostat?: number,
++
++    /**
++     * Mirostat target entropy (tau) - the desired perplexity of the generated text.
++     *
++     * Only relevant when `mirostat` is enabled.
++     *
++     * Defaults to `5.0`.
++     */
++    mirostatTau?: number,
++
++    /**
++     * Mirostat learning rate (eta) - how quickly the algorithm responds to feedback from the generated text.
++     *
++     * Only relevant when `mirostat` is enabled.
++     *
++     * Defaults to `0.1`.
++     */
++    mirostatEta?: number,
++
+     /**
+      * Used to control the randomness of the generated text.
+      *

@@ -76,15 +76,36 @@ KV cache 重用有幾個層面的限制，不是萬用的加速手段：
    shift（預設策略是抹掉最早的回覆、保留最前面的 system prompt），被抹掉的部分下次
    要重新計算，快取加速的效果會隨對話變長而遞減。
 
-**不算限制的部分**：temperature / top-p / top-k / seed 等取樣參數**不影響** KV
-cache——它們只影響「算完 K/V 之後怎麼挑下一個 token」，不影響 K/V 本身的計算結果，
-可以每次請求自由調整而不會讓 cache 失效（這也是前端 Temperature 滑桿可以隨意調整、
-完全不用重新 prefill 的原因）。
+**不算限制的部分**：temperature / top-p / top-k / min-p / mirostat / repeat penalty
+等取樣參數**不影響** KV cache——它們只影響「算完 K/V 之後怎麼挑下一個 token」，不影響
+K/V 本身的計算結果，可以每次請求自由調整而不會讓 cache 失效（這也是前端 Sampling
+區塊的滑桿可以隨意調整、完全不用重新 prefill 的原因）。
 
 ## 前端功能
 
 - **Conversations**：左側可切換/刪除多個對話，各自對應一個後端 session。
-- **Model Configuration**：顯示目前載入的本機模型與 context size，並可調整生成溫度（Temperature）。
+- **Model Configuration**：顯示目前載入的本機模型與 context size。
+- **Sampling**：調整生成時的取樣參數，設定值存在瀏覽器 localStorage，每個對話
+  （conversation）各自獨立記憶：
+  - **Temperature**（預設 `1.0`）：滑桿下限鎖定在 `0.1`，避免設成 `0` 導致模型
+    每次都輸出同一個 token。
+  - **Top-k**（預設 `0` = 停用，取完整詞彙表）
+  - **Top-p**（預設 `1.0` = 停用）
+  - **Min-P**（預設 `0.05`）
+  - **啟用 Mirostat** 開關：切換是否改用 Mirostat 2.0 動態調整取樣（取代
+    Top-k/Top-p/Min-p，但 Temperature 仍會先套用）。啟用後 Top-k/Top-p/Min-p
+    會停用，Temperature 保持可調（因為取樣時仍會先用它調整 logits，再交給
+    Mirostat 處理），改用下面兩個：
+    - **Mirostat Target**（`mirostat_tau`，預設 `5.0`）：目標困惑度（entropy）。
+    - **Mirostat Learning Rate**（`mirostat_eta`，預設 `0.1`）：演算法根據生成結果
+      調整取樣的反應速度。
+  - Repeat Penalty 固定為 `1.1`（見 `backend/src/config.js` 的 `repeatPenalty`），
+    套用到每次生成，沒有對應的 UI 控制項。
+
+  Mirostat 取樣（llama.cpp 的 `--mirostat`）沒有被公開發布的 `node-llama-cpp` npm
+  套件開放對應的 JS 參數，因此這個功能仰賴 `backend/node-llama-cpp-src` 這份自行
+  patch 過的版本（見 `backend/node-llama-cpp-patches/mirostat-sampling.patch`），
+  不是單純呼叫上游套件就能取得。
 - **Set System Prompt**：取代原本內嵌的 system prompt 編輯區，改為一個按鈕開啟彈窗，
   輸入新的 system prompt 後會呼叫 `POST /api/system-prompt` 儲存並重新產生 KV cache
   （所有既有對話的 session 也會一併被釋放，下次發言時會套用新 cache 重新開始）。

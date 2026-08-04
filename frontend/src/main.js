@@ -36,6 +36,10 @@ let isGenerating = false;
 let abortController = null;
 let modelInfo = null;
 let useKvCache = true;
+// Thinking content for the most recently generated assistant reply. Deliberately
+// not part of `conversations`/localStorage - it's a live-session-only artifact,
+// reset per turn, and only ever shown for the latest assistant message.
+let liveThinkingText = null;
 
 // --- DOM Elements ---
 const chatListEl = document.getElementById("chat-list");
@@ -44,10 +48,22 @@ const modelNameDisplayEl = document.getElementById("model-name-display");
 const contextSizeDisplayEl = document.getElementById("context-size-display");
 const tempSliderEl = document.getElementById("temp-slider");
 const tempValEl = document.getElementById("temp-val");
+const topKSliderEl = document.getElementById("top-k-slider");
+const topKValEl = document.getElementById("top-k-val");
+const topPSliderEl = document.getElementById("top-p-slider");
+const topPValEl = document.getElementById("top-p-val");
+const minPSliderEl = document.getElementById("min-p-slider");
+const minPValEl = document.getElementById("min-p-val");
+const mirostatToggleEl = document.getElementById("mirostat-toggle");
+const mirostatTargetSliderEl = document.getElementById("mirostat-target-slider");
+const mirostatTargetValEl = document.getElementById("mirostat-target-val");
+const mirostatLrSliderEl = document.getElementById("mirostat-lr-slider");
+const mirostatLrValEl = document.getElementById("mirostat-lr-val");
 const cacheBadgeEl = document.getElementById("cache-status-badge");
 const systemPromptStatusTextEl = document.getElementById("system-prompt-status-text");
 const setSystemPromptBtn = document.getElementById("set-system-prompt-btn");
 const useCacheToggleEl = document.getElementById("use-cache-toggle");
+const thinkingModeToggleEl = document.getElementById("thinking-mode-toggle");
 const chatTitleEl = document.getElementById("current-chat-title");
 const activeModelBadgeEl = document.getElementById("active-model-badge");
 const sessionCacheBadgeEl = document.getElementById("session-cache-badge");
@@ -85,9 +101,42 @@ async function init() {
         localStorage.setItem(USE_CACHE_STORAGE_KEY, String(useKvCache));
     });
 
+    // Unlike useKvCache (a global default for new sessions), thinking mode is locked
+    // into each conversation once it starts - see updateThinkingModeToggleUI().
+    thinkingModeToggleEl.addEventListener("change", () => {
+        const conv = conversations.find((c) => c.id === activeConversationId);
+        if (!conv) return;
+        conv.thinkingMode = thinkingModeToggleEl.checked;
+        saveConversationsToStorage();
+    });
+
     newChatBtn.addEventListener("click", handleNewChat);
     tempSliderEl.addEventListener("input", (e) => {
         tempValEl.textContent = e.target.value;
+        updateActiveConversationConfig();
+    });
+    topKSliderEl.addEventListener("input", (e) => {
+        topKValEl.textContent = e.target.value;
+        updateActiveConversationConfig();
+    });
+    topPSliderEl.addEventListener("input", (e) => {
+        topPValEl.textContent = e.target.value;
+        updateActiveConversationConfig();
+    });
+    minPSliderEl.addEventListener("input", (e) => {
+        minPValEl.textContent = e.target.value;
+        updateActiveConversationConfig();
+    });
+    mirostatTargetSliderEl.addEventListener("input", (e) => {
+        mirostatTargetValEl.textContent = e.target.value;
+        updateActiveConversationConfig();
+    });
+    mirostatLrSliderEl.addEventListener("input", (e) => {
+        mirostatLrValEl.textContent = e.target.value;
+        updateActiveConversationConfig();
+    });
+    mirostatToggleEl.addEventListener("change", () => {
+        applyMirostatDisabledState(mirostatToggleEl.checked);
         updateActiveConversationConfig();
     });
 
@@ -149,11 +198,14 @@ function updateCacheStatus(cache) {
     }
     cacheBadgeEl.className = "badge badge-active";
     cacheBadgeEl.textContent = "Cached (KV)";
-    const sizeMb = (cache.cacheSizeBytes / (1024 * 1024)).toFixed(2);
+    const thinkingMb = (cache.thinking.cacheSizeBytes / (1024 * 1024)).toFixed(2);
+    const noThinkingMb = (cache.noThinking.cacheSizeBytes / (1024 * 1024)).toFixed(2);
     const when = cache.generatedAt ? new Date(cache.generatedAt).toLocaleTimeString() : "-";
     systemPromptStatusTextEl.textContent =
-        `已快取 ${cache.promptTokens.toLocaleString()} tokens（${sizeMb} MB），` +
-        `於 ${when} 產生。開啟新對話時會直接套用這份 cache。`;
+        `已快取兩份 KV cache（於 ${when} 產生）：` +
+        `Thinking ON ${cache.thinking.promptTokens.toLocaleString()} tokens（${thinkingMb} MB）、` +
+        `Thinking OFF ${cache.noThinking.promptTokens.toLocaleString()} tokens（${noThinkingMb} MB）。` +
+        `開啟新對話時會依 Thinking Mode 開關套用對應的 cache。`;
 }
 
 // --- Conversation Management ---
@@ -178,13 +230,30 @@ function saveConversationsToStorage() {
     localStorage.setItem(STORAGE_KEY, JSON.stringify(conversations));
 }
 
+/** Enables/disables the sampling inputs that Mirostat replaces vs. the ones it uses.
+ *  Temperature stays enabled either way - it's still applied before Mirostat picks a token. */
+function applyMirostatDisabledState(mirostatEnabled) {
+    topKSliderEl.disabled = mirostatEnabled;
+    topPSliderEl.disabled = mirostatEnabled;
+    minPSliderEl.disabled = mirostatEnabled;
+    mirostatTargetSliderEl.disabled = !mirostatEnabled;
+    mirostatLrSliderEl.disabled = !mirostatEnabled;
+}
+
 function handleNewChat() {
     const id = `chat_${Date.now()}`;
     const newConv = {
         id,
         title: "New Conversation",
         sessionId: null,
-        temperature: 0.7,
+        temperature: 1.0,
+        topK: 0,
+        topP: 1.0,
+        minP: 0.05,
+        mirostat: false,
+        mirostatTau: 5.0,
+        mirostatEta: 0.1,
+        thinkingMode: true,
         messages: [],
         created: Date.now(),
     };
@@ -226,15 +295,33 @@ function renderChatList() {
 }
 
 function selectConversation(id) {
+    // Thinking content doesn't follow you across conversations - it's shown only
+    // for the reply that was just live-generated in this browser tab. Only clear it
+    // on an actual switch, so re-clicking the already-active conversation doesn't
+    // wipe out what was just generated.
+    if (id !== activeConversationId) liveThinkingText = null;
     activeConversationId = id;
     const conv = conversations.find((c) => c.id === id);
     if (!conv) return;
 
-    tempSliderEl.value = conv.temperature ?? 0.7;
-    tempValEl.textContent = conv.temperature ?? 0.7;
+    tempSliderEl.value = conv.temperature ?? 1.0;
+    tempValEl.textContent = conv.temperature ?? 1.0;
+    topKSliderEl.value = conv.topK ?? 0;
+    topKValEl.textContent = conv.topK ?? 0;
+    topPSliderEl.value = conv.topP ?? 1.0;
+    topPValEl.textContent = conv.topP ?? 1.0;
+    minPSliderEl.value = conv.minP ?? 0.05;
+    minPValEl.textContent = conv.minP ?? 0.05;
+    mirostatTargetSliderEl.value = conv.mirostatTau ?? 5.0;
+    mirostatTargetValEl.textContent = conv.mirostatTau ?? 5.0;
+    mirostatLrSliderEl.value = conv.mirostatEta ?? 0.1;
+    mirostatLrValEl.textContent = conv.mirostatEta ?? 0.1;
+    mirostatToggleEl.checked = conv.mirostat ?? false;
+    applyMirostatDisabledState(mirostatToggleEl.checked);
 
     chatTitleEl.textContent = conv.title;
     updateSessionCacheBadge(conv);
+    updateThinkingModeToggleUI(conv);
 
     renderChatList();
     renderMessages();
@@ -264,13 +351,23 @@ function updateActiveConversationConfig() {
     const conv = conversations.find((c) => c.id === activeConversationId);
     if (!conv) return;
     conv.temperature = parseFloat(tempSliderEl.value);
+    conv.topK = parseInt(topKSliderEl.value, 10);
+    conv.topP = parseFloat(topPSliderEl.value);
+    conv.minP = parseFloat(minPSliderEl.value);
+    conv.mirostat = mirostatToggleEl.checked;
+    conv.mirostatTau = parseFloat(mirostatTargetSliderEl.value);
+    conv.mirostatEta = parseFloat(mirostatLrSliderEl.value);
     saveConversationsToStorage();
 }
 
 /** Returns a live backend sessionId for this conversation, creating one if needed. */
 async function ensureSession(conv) {
     if (conv.sessionId) return conv.sessionId;
-    const { sessionId, usedCache } = await createSession(useKvCache);
+    // conv.messages already includes the message about to be sent (it's pushed
+    // before ensureSession is called) - exclude it, since it's sent separately
+    // as the actual prompt. The rest replays prior turns lost to a backend restart.
+    const history = conv.messages.slice(0, -1);
+    const { sessionId, usedCache } = await createSession(useKvCache, history, conv.thinkingMode ?? true);
     conv.sessionId = sessionId;
     conv.usedCache = usedCache;
     saveConversationsToStorage();
@@ -289,6 +386,18 @@ function updateSessionCacheBadge(conv) {
     sessionCacheBadgeEl.textContent = conv.usedCache ? "Cache: ON" : "Cache: OFF (cold start)";
 }
 
+/**
+ * Reflects the active conversation's thinking-mode setting in the toggle, and locks
+ * it once the conversation already has messages - the mode is baked into the
+ * `<|think|>` prefix of whatever KV cache/session was already used for those turns,
+ * so it can't change mid-conversation. Only a brand new conversation can pick it.
+ */
+function updateThinkingModeToggleUI(conv) {
+    if (!conv) return;
+    thinkingModeToggleEl.checked = conv.thinkingMode ?? true;
+    thinkingModeToggleEl.disabled = conv.messages.length > 0;
+}
+
 // --- Messages Rendering ---
 function renderMessages() {
     const conv = conversations.find((c) => c.id === activeConversationId);
@@ -303,15 +412,51 @@ function renderMessages() {
     welcomeScreenEl.style.display = "none";
     messagesContainerEl.innerHTML = "";
 
-    conv.messages.forEach((msg) => {
-        messagesContainerEl.appendChild(createMessageBubble(msg));
+    conv.messages.forEach((msg, i) => {
+        const isLatestAssistantReply = msg.role === "assistant" && i === conv.messages.length - 1;
+        messagesContainerEl.appendChild(
+            createMessageBubble(msg, isLatestAssistantReply ? liveThinkingText : null)
+        );
     });
 
     renderIcons();
     scrollToBottom();
 }
 
-function createMessageBubble(msg) {
+/**
+ * Builds a collapsible "thinking" box + toggle button pair. Not used for anything
+ * persisted - callers only ever attach this for the most recently generated
+ * assistant reply, using text held in the transient `liveThinkingText` variable.
+ */
+function createThinkingBox() {
+    const toggleBtn = document.createElement("button");
+    toggleBtn.type = "button";
+    toggleBtn.className = "thinking-toggle-btn";
+
+    const box = document.createElement("div");
+    box.className = "thinking-box hidden";
+    const textEl = document.createElement("div");
+    textEl.className = "thinking-text";
+    box.appendChild(textEl);
+
+    const setLabel = (visible) => {
+        toggleBtn.innerHTML = visible
+            ? '<i data-lucide="brain" class="thinking-icon"></i> 隱藏思考內容'
+            : '<i data-lucide="brain" class="thinking-icon"></i> 顯示思考內容';
+    };
+    setLabel(false);
+
+    toggleBtn.addEventListener("click", () => {
+        const visible = box.classList.toggle("hidden") === false;
+        setLabel(visible);
+        renderIcons();
+    });
+
+    return { toggleBtn, box, textEl };
+}
+
+/** thinkingText (optional) is only ever passed for the latest assistant message - see renderMessages(). */
+function createMessageBubble(msg, thinkingText) {
     const container = document.createElement("div");
     container.className = `message ${msg.role}`;
 
@@ -323,9 +468,18 @@ function createMessageBubble(msg) {
     content.className = "message-content";
 
     if (msg.role === "assistant") {
-        content.innerHTML = marked.parse(msg.content || "");
-        addCodeBlockCopyButtons(content);
-        highlightCodeBlocks(content);
+        if (thinkingText) {
+            const thinkingBox = createThinkingBox();
+            thinkingBox.textEl.textContent = thinkingText;
+            content.appendChild(thinkingBox.toggleBtn);
+            content.appendChild(thinkingBox.box);
+        }
+        const answerEl = document.createElement("div");
+        answerEl.className = "answer-text";
+        answerEl.innerHTML = marked.parse(msg.content || "");
+        content.appendChild(answerEl);
+        addCodeBlockCopyButtons(answerEl);
+        highlightCodeBlocks(answerEl);
     } else {
         content.textContent = msg.content;
     }
@@ -416,6 +570,9 @@ async function handleSendMessage(e) {
     const userMsg = { role: "user", content: text };
     conv.messages.push(userMsg);
     saveConversationsToStorage();
+    // Conversation just started (or already had) messages - lock the thinking-mode
+    // toggle to whatever this conversation is committed to.
+    updateThinkingModeToggleUI(conv);
 
     welcomeScreenEl.style.display = "none";
     messagesContainerEl.appendChild(createMessageBubble(userMsg));
@@ -428,11 +585,17 @@ async function handleSendMessage(e) {
     avatar.innerHTML = `<i data-lucide="bot" class="avatar-icon"></i>`;
     const content = document.createElement("div");
     content.className = "message-content";
-    content.innerHTML = `
+    // thinkingBox (toggle button + collapsible text) is only inserted lazily, into
+    // `content` ahead of `answerEl`, the first time a thinking chunk actually arrives.
+    let thinkingBox = null;
+    const answerEl = document.createElement("div");
+    answerEl.className = "answer-text";
+    answerEl.innerHTML = `
         <div class="typing-indicator">
             <span class="typing-dot"></span><span class="typing-dot"></span><span class="typing-dot"></span>
         </div>
     `;
+    content.appendChild(answerEl);
     assistantBubble.appendChild(avatar);
     assistantBubble.appendChild(content);
     messagesContainerEl.appendChild(assistantBubble);
@@ -448,24 +611,46 @@ async function handleSendMessage(e) {
 
     let assistantText = "";
     let isFirstChunk = true;
+    let thinkingText = "";
+    liveThinkingText = null;
 
     try {
         const sessionId = await ensureSession(conv);
 
         const stats = await sendMessage(sessionId, text, {
             temperature: conv.temperature,
+            topK: conv.topK,
+            topP: conv.topP,
+            minP: conv.minP,
+            mirostat: conv.mirostat ? 2 : 0,
+            mirostatTau: conv.mirostatTau,
+            mirostatEta: conv.mirostatEta,
             signal: abortController.signal,
             onChunk: (chunk) => {
                 if (isFirstChunk) {
-                    content.innerHTML = "";
+                    answerEl.innerHTML = "";
                     isFirstChunk = false;
                 }
                 assistantText += chunk;
-                content.innerHTML = marked.parse(assistantText);
-                addCodeBlockCopyButtons(content);
+                answerEl.innerHTML = marked.parse(assistantText);
+                addCodeBlockCopyButtons(answerEl);
                 scrollToBottom();
             },
+            onThinkingChunk: (chunk) => {
+                if (!thinkingBox) {
+                    thinkingBox = createThinkingBox();
+                    content.insertBefore(thinkingBox.box, answerEl);
+                    content.insertBefore(thinkingBox.toggleBtn, thinkingBox.box);
+                    renderIcons();
+                }
+                thinkingText += chunk;
+                thinkingBox.textEl.textContent = thinkingText;
+            },
         });
+
+        // Not persisted to conv.messages/localStorage - only kept for this live render,
+        // and only shown again if renderMessages() re-runs before the next turn starts.
+        liveThinkingText = thinkingText || null;
 
         const assistantMsg = { role: "assistant", content: assistantText, stats };
         conv.messages.push(assistantMsg);
@@ -478,8 +663,8 @@ async function handleSendMessage(e) {
             console.log("Generation aborted");
         } else {
             console.error("Send message error:", error);
-            if (isFirstChunk) content.innerHTML = "";
-            content.innerHTML += `<div class="error-box">
+            if (isFirstChunk) answerEl.innerHTML = "";
+            answerEl.innerHTML += `<div class="error-box">
                 <strong>發生錯誤：</strong> ${error.message}<br>
                 <small>請確認後端伺服器正在執行，且模型已成功載入。</small>
             </div>`;
@@ -579,8 +764,9 @@ async function handleSaveSystemPrompt() {
 
         updateCacheStatus(cache);
         systemPromptModalStatusEl.textContent =
-            `已儲存！新的 system prompt 已快取（${cache.promptTokens.toLocaleString()} tokens，` +
-            `花費 ${cache.prefillMs}ms）。`;
+            `已儲存！已重新產生兩份 KV cache — ` +
+            `Thinking ON：${cache.thinking.promptTokens.toLocaleString()} tokens/${cache.thinking.prefillMs}ms，` +
+            `Thinking OFF：${cache.noThinking.promptTokens.toLocaleString()} tokens/${cache.noThinking.prefillMs}ms。`;
         systemPromptModalStatusEl.className = "modal-status success";
 
         setTimeout(closeSystemPromptModal, 1500);

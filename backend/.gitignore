@@ -1,3 +1,8 @@
 node_modules/
 cache/
 .env
+
+# Vendored, patched node-llama-cpp - rebuilt from scratch via scripts/setup-node-llama-cpp.mjs
+# (see node-llama-cpp-patches/), not committed since it's ~750MB of upstream source/build output.
+node-llama-cpp-src/
+node-llama-cpp-src.bak/

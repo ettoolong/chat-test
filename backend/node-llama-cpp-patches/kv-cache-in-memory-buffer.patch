@@ -1,0 +1,255 @@
+diff --git a/llama/addon/AddonContext.cpp b/llama/addon/AddonContext.cpp
+index 9427e8f..15a4dc0 100644
+--- a/llama/addon/AddonContext.cpp
++++ b/llama/addon/AddonContext.cpp
+@@ -968,6 +968,130 @@ Napi::Value AddonContext::LoadSequenceStateFromFile(const Napi::CallbackInfo& in
+     return worker->GetPromise();
+ }
+ 
++class AddonContextSaveSequenceStateToBufferWorker : public Napi::AsyncWorker {
++    public:
++        AddonContext* context;
++        llama_seq_id sequenceId;
++        std::vector<uint8_t> data;
++
++        AddonContextSaveSequenceStateToBufferWorker(const Napi::CallbackInfo& info, AddonContext* context)
++            : Napi::AsyncWorker(info.Env(), "AddonContextSaveSequenceStateToBufferWorker"),
++              context(context),
++              deferred(Napi::Promise::Deferred::New(info.Env())) {
++            context->Ref();
++
++            sequenceId = info[0].As<Napi::Number>().Int32Value();
++        }
++        ~AddonContextSaveSequenceStateToBufferWorker() {
++            context->Unref();
++        }
++
++        Napi::Promise GetPromise() {
++            return deferred.Promise();
++        }
++
++    protected:
++        Napi::Promise::Deferred deferred;
++
++        void Execute() {
++            try {
++                const size_t stateSize = llama_state_seq_get_size(context->ctx, sequenceId);
++                if (stateSize == 0) {
++                    SetError("Failed to get sequence state size");
++                    return;
++                }
++
++                data.resize(stateSize);
++                const size_t writtenSize = llama_state_seq_get_data(context->ctx, data.data(), stateSize, sequenceId);
++                if (writtenSize == 0) {
++                    SetError("Failed to save state to buffer");
++                    return;
++                }
++
++                data.resize(writtenSize);
++            } catch (const std::exception& e) {
++                SetError(e.what());
++            } catch(...) {
++                SetError("Unknown error when calling \"llama_state_seq_get_data\"");
++            }
++        }
++        void OnOK() {
++            deferred.Resolve(Napi::Buffer<uint8_t>::Copy(Env(), data.data(), data.size()));
++        }
++        void OnError(const Napi::Error& err) {
++            deferred.Reject(err.Value());
++        }
++};
++Napi::Value AddonContext::SaveSequenceStateToBuffer(const Napi::CallbackInfo& info) {
++    if (disposed) {
++        Napi::Error::New(info.Env(), "Context is disposed").ThrowAsJavaScriptException();
++        return info.Env().Undefined();
++    }
++
++    AddonContextSaveSequenceStateToBufferWorker* worker = new AddonContextSaveSequenceStateToBufferWorker(info, this);
++    worker->Queue();
++    return worker->GetPromise();
++}
++
++class AddonContextLoadSequenceStateFromBufferWorker : public Napi::AsyncWorker {
++    public:
++        AddonContext* context;
++        llama_seq_id sequenceId;
++        std::vector<uint8_t> data;
++
++        AddonContextLoadSequenceStateFromBufferWorker(const Napi::CallbackInfo& info, AddonContext* context)
++            : Napi::AsyncWorker(info.Env(), "AddonContextLoadSequenceStateFromBufferWorker"),
++              context(context),
++              deferred(Napi::Promise::Deferred::New(info.Env())) {
++            context->Ref();
++
++            Napi::Buffer<uint8_t> inputBuffer = info[0].As<Napi::Buffer<uint8_t>>();
++            sequenceId = info[1].As<Napi::Number>().Int32Value();
++
++            data.assign(inputBuffer.Data(), inputBuffer.Data() + inputBuffer.Length());
++        }
++        ~AddonContextLoadSequenceStateFromBufferWorker() {
++            context->Unref();
++        }
++
++        Napi::Promise GetPromise() {
++            return deferred.Promise();
++        }
++
++    protected:
++        Napi::Promise::Deferred deferred;
++
++        void Execute() {
++            try {
++                const size_t readSize = llama_state_seq_set_data(context->ctx, data.data(), data.size(), sequenceId);
++                if (readSize == 0) {
++                    SetError("Failed to load state from buffer. Current context sequence size may be smaller than the state in the buffer");
++                    return;
++                }
++            } catch (const std::exception& e) {
++                SetError(e.what());
++            } catch(...) {
++                SetError("Unknown error when calling \"llama_state_seq_set_data\"");
++            }
++        }
++        void OnOK() {
++            deferred.Resolve(Env().Undefined());
++        }
++        void OnError(const Napi::Error& err) {
++            deferred.Reject(err.Value());
++        }
++};
++Napi::Value AddonContext::LoadSequenceStateFromBuffer(const Napi::CallbackInfo& info) {
++    if (disposed) {
++        Napi::Error::New(info.Env(), "Context is disposed").ThrowAsJavaScriptException();
++        return info.Env().Undefined();
++    }
++
++    AddonContextLoadSequenceStateFromBufferWorker* worker = new AddonContextLoadSequenceStateFromBufferWorker(info, this);
++    worker->Queue();
++    return worker->GetPromise();
++}
++
+ Napi::Value AddonContext::PrintTimings(const Napi::CallbackInfo& info) {
+     llama_perf_context_print(ctx);
+     llama_perf_context_reset(ctx);
+@@ -1145,6 +1269,8 @@ void AddonContext::init(Napi::Object exports) {
+                 InstanceMethod("ensureDraftContextIsCompatibleForSpeculative", &AddonContext::EnsureDraftContextIsCompatibleForSpeculative),
+                 InstanceMethod("saveSequenceStateToFile", &AddonContext::SaveSequenceStateToFile),
+                 InstanceMethod("loadSequenceStateFromFile", &AddonContext::LoadSequenceStateFromFile),
++                InstanceMethod("saveSequenceStateToBuffer", &AddonContext::SaveSequenceStateToBuffer),
++                InstanceMethod("loadSequenceStateFromBuffer", &AddonContext::LoadSequenceStateFromBuffer),
+                 InstanceMethod("setLoras", &AddonContext::SetLoras),
+                 InstanceMethod("restoreCheckpoint", &AddonContext::RestoreCheckpoint),
+                 InstanceMethod("dispose", &AddonContext::Dispose),
+diff --git a/llama/addon/AddonContext.h b/llama/addon/AddonContext.h
+index 6f5f193..1a76e3b 100644
+--- a/llama/addon/AddonContext.h
++++ b/llama/addon/AddonContext.h
+@@ -56,6 +56,8 @@ class AddonContext : public Napi::ObjectWrap<AddonContext> {
+ 
+         Napi::Value SaveSequenceStateToFile(const Napi::CallbackInfo& info);
+         Napi::Value LoadSequenceStateFromFile(const Napi::CallbackInfo& info);
++        Napi::Value SaveSequenceStateToBuffer(const Napi::CallbackInfo& info);
++        Napi::Value LoadSequenceStateFromBuffer(const Napi::CallbackInfo& info);
+ 
+         Napi::Value PrintTimings(const Napi::CallbackInfo& info);
+         Napi::Value EnsureDraftContextIsCompatibleForSpeculative(const Napi::CallbackInfo& info);
+diff --git a/src/bindings/AddonTypes.ts b/src/bindings/AddonTypes.ts
+index 63a879e..a7f317c 100644
+--- a/src/bindings/AddonTypes.ts
++++ b/src/bindings/AddonTypes.ts
+@@ -192,6 +192,8 @@ export type AddonContext = {
+     ensureDraftContextIsCompatibleForSpeculative(draftContext: AddonContext): void,
+     saveSequenceStateToFile(filePath: string, sequenceId: number, tokens: Uint32Array): Promise<number>,
+     loadSequenceStateFromFile(filePath: string, sequenceId: number, maxContextSize: number): Promise<Uint32Array>,
++    saveSequenceStateToBuffer(sequenceId: number): Promise<Buffer>,
++    loadSequenceStateFromBuffer(buffer: Buffer, sequenceId: number): Promise<void>,
+     setLoras(loras: AddonModelLora[], scales: number[]): void,
+ 
+     restoreCheckpoint(checkpoint: AddonContextSequenceCheckpoint, maxPosIndex: number): Promise<boolean>
+diff --git a/src/evaluator/LlamaContext/LlamaContext.ts b/src/evaluator/LlamaContext/LlamaContext.ts
+index cde9735..f3b2ecd 100644
+--- a/src/evaluator/LlamaContext/LlamaContext.ts
++++ b/src/evaluator/LlamaContext/LlamaContext.ts
+@@ -1897,6 +1897,80 @@ export class LlamaContextSequence {
+         }
+     }
+ 
++    /**
++     * Save the current context sequence evaluation state to an in-memory buffer.
++     *
++     * Unlike {@link saveStateToFile}, this doesn't touch the filesystem, so the result can be kept in memory
++     * and reused across multiple context sequences without re-reading it from disk every time.
++     */
++    public async saveStateToBuffer(): Promise<{buffer: Buffer, tokens: Token[]}> {
++        this._ensureNotDisposed();
++
++        const evaluatorLock = await acquireLock([this._lock, "evaluate"]);
++        const contextLock = await acquireLock([this._context, "context"]);
++
++        try {
++            this._ensureNotDisposed();
++
++            const buffer = await this._context._ctx.saveSequenceStateToBuffer(this._sequenceId);
++            return {buffer, tokens: this.contextTokens.slice()};
++        } finally {
++            contextLock.dispose();
++            evaluatorLock.dispose();
++        }
++    }
++
++    /* eslint-disable @stylistic/max-len */
++    /**
++     * Load a context sequence evaluation state from an in-memory buffer previously created via {@link saveStateToBuffer}.
++     *
++     * Trying to load a state with a longer token list than the current sequence's context size will fail and throw an error.
++     *
++     * You must ensure that the buffer was created from the exact same model, otherwise, using this function may crash the process.
++     * @see [Saving and restoring a context sequence evaluation state](https://node-llama-cpp.withcat.ai/guide/chat-session#save-and-restore-with-context-sequence-state)
++     */
++    public async loadStateFromBuffer(buffer: Buffer, tokens: Token[], acceptRisk: {
++        /**
++         * Loading a state created using a different model may crash the process.
++         *
++         * You must accept this risk to use this feature.
++         */
++        acceptRisk: true
++    }) {
++        /* eslint-enable @stylistic/max-len */
++        if (!acceptRisk.acceptRisk)
++            throw new Error("The `acceptRisk` option must be set to `true` to use this feature");
++
++        this._ensureNotDisposed();
++
++        if (tokens.length > this.contextSize)
++            throw new Error("The given state is too large for the current context size");
++
++        const evaluatorLock = await acquireLock([this._lock, "evaluate"]);
++        const contextLock = await acquireLock([this._context, "context"]);
++
++        try {
++            this._ensureNotDisposed();
++
++            this._tokenPredictorOwner = {};
++            await this._abortTokenPredictor(true);
++            this._ensureNotDisposed();
++
++            this._loadedTokenPredictions.length = 0;
++            this._nextTokenIndex = 0;
++            this._contextTokens = [];
++
++            await this._context._ctx.loadSequenceStateFromBuffer(buffer, this._sequenceId);
++
++            this._contextTokens = tokens.slice();
++            this._nextTokenIndex = tokens.length;
++            this._loadedTokenPredictions.length = 0;
++        } finally {
++            contextLock.dispose();
++            evaluatorLock.dispose();
++        }
++    }
++
+     /**
+      * When reusing a prefix evaluation state is not possible for the current context sequence
+      * (like in contexts from recurrent and hybrid models,

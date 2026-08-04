@@ -24,12 +24,18 @@ export async function setSystemPrompt(systemPrompt) {
     return body;
 }
 
-/** Creates a session. Returns { sessionId, usedCache }. */
-export async function createSession(useCache = true) {
+/**
+ * Creates a session. `history` (optional) replays prior turns into the new
+ * session - used when reconnecting to a conversation whose backend session
+ * was lost (e.g. after a server restart). `thinkingMode` picks which of the
+ * two pre-baked system-prompt caches to load and must match whatever mode
+ * this conversation was started with. Returns { sessionId, usedCache, thinkingMode }.
+ */
+export async function createSession(useCache = true, history = undefined, thinkingMode = true) {
     const res = await fetch(`${API_BASE}/api/sessions`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ useCache }),
+        body: JSON.stringify({ useCache, history, thinkingMode }),
     });
     if (!res.ok) {
         const body = await res.json().catch(() => ({}));
@@ -47,11 +53,15 @@ export async function deleteSession(sessionId) {
  * Calls onChunk(text) for every piece of generated text, and resolves with the
  * final { promptTokens, promptEvalDurationMs, prefillSpeed, genSpeed, cacheHit } stats.
  */
-export async function sendMessage(sessionId, message, { temperature, onChunk, signal } = {}) {
+export async function sendMessage(
+    sessionId,
+    message,
+    { temperature, topK, topP, minP, mirostat, mirostatTau, mirostatEta, onChunk, onThinkingChunk, signal } = {}
+) {
     const res = await fetch(`${API_BASE}/api/sessions/${sessionId}/messages`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ message, temperature }),
+        body: JSON.stringify({ message, temperature, topK, topP, minP, mirostat, mirostatTau, mirostatEta }),
         signal,
     });
 
@@ -79,6 +89,7 @@ export async function sendMessage(sessionId, message, { temperature, onChunk, si
             const parsed = JSON.parse(line);
             if (parsed.error) throw new Error(parsed.error);
             if (parsed.chunk) onChunk?.(parsed.chunk);
+            if (parsed.thinkingChunk) onThinkingChunk?.(parsed.thinkingChunk);
             if (parsed.stats) stats = parsed.stats;
         }
     }

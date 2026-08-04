@@ -40,13 +40,20 @@ export const config = {
     // in the chat metrics. Heuristic - tune to taste for your hardware.
     cacheHitPrefillThreshold: envInt("CACHE_HIT_PREFILL_THRESHOLD", 300),
 
+    // Not exposed in the UI - applied to every generation regardless of the other
+    // sampling settings the user picks.
+    repeatPenalty: 1.1,
+
     systemPromptFile: process.env.SYSTEM_PROMPT_FILE
         ? path.resolve(process.env.SYSTEM_PROMPT_FILE)
         : path.join(backendRoot, "system-prompt.txt"),
 
     cacheDir: path.join(backendRoot, "cache"),
-    get systemPromptCacheFile() {
-        return path.join(this.cacheDir, "system-prompt.cache");
+    // Thinking mode changes the token sequence at the very front of the system
+    // prompt (see Gemma4ChatWrapper's `<|think|>` prefix), so each mode needs its
+    // own cache file - one can never be a prefix-match substitute for the other.
+    systemPromptCacheFile(thinking) {
+        return path.join(this.cacheDir, thinking ? "system-prompt-thinking.cache" : "system-prompt-no-thinking.cache");
     },
 };
 

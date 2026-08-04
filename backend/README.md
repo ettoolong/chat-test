@@ -4,11 +4,30 @@ Node.js + Express + [node-llama-cpp](https://node-llama-cpp.withcat.ai/). No Doc
 
 ## Setup
 
+This project uses a patched build of `node-llama-cpp` (see below), so on a fresh
+clone build it first, then install the rest of the dependencies:
+
 ```bash
+npm run setup:node-llama-cpp   # clones+patches+builds node-llama-cpp-src/ (needs git, cmake, a C++ toolchain)
 npm install
 cp .env.example .env   # optional, defaults work out of the box
 npm run dev
 ```
+
+### Patched node-llama-cpp
+
+`node-llama-cpp` only supports saving/loading a context sequence's KV-cache
+state to/from a file (`saveStateToFile`/`loadStateFromFile`), which means every
+`createSession()` call re-reads the system-prompt cache from disk. To let the
+server keep that cache in RAM instead and apply it to a fresh sequence without
+touching the filesystem, `node-llama-cpp-patches/kv-cache-in-memory-buffer.patch`
+adds `saveStateToBuffer`/`loadStateFromBuffer` (JS wrapper + a small native addon
+binding calling llama.cpp's existing `llama_state_seq_get_data`/`llama_state_seq_set_data`).
+
+`node-llama-cpp-src/` (the vendored, patched checkout) isn't committed - it's
+~750MB of upstream source, `node_modules`, and build output, all reproducible
+from the patch. Run `npm run setup:node-llama-cpp` to (re)generate it; see
+`scripts/setup-node-llama-cpp.mjs` for exactly what it does.
 
 On startup the server loads the model, creates a multi-sequence context, and
 either reuses or (re)generates the system-prompt KV-cache file in `cache/`

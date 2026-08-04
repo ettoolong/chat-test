@@ -55,8 +55,10 @@ app.post("/api/system-prompt", async (req, res) => {
 app.post("/api/sessions", async (req, res) => {
     try {
         const useCache = req.body?.useCache !== false; // default true
-        const { sessionId, usedCache } = await createSession(useCache);
-        res.json({ sessionId, usedCache });
+        const thinking = req.body?.thinkingMode !== false; // default true
+        const history = Array.isArray(req.body?.history) ? req.body.history : undefined;
+        const { sessionId, usedCache, thinking: thinkingMode } = await createSession(useCache, history, thinking);
+        res.json({ sessionId, usedCache, thinkingMode });
     } catch (err) {
         console.error("[POST /api/sessions]", err);
         res.status(err.statusCode || 500).json({ error: err.message });
@@ -71,7 +73,7 @@ app.delete("/api/sessions/:sessionId", (req, res) => {
 
 app.post("/api/sessions/:sessionId/messages", async (req, res) => {
     const { sessionId } = req.params;
-    const { message, temperature } = req.body || {};
+    const { message, temperature, topK, topP, minP, mirostat, mirostatTau, mirostatEta } = req.body || {};
 
     if (!message || typeof message !== "string") {
         return res.status(400).json({ error: "Missing 'message' string in body" });
@@ -112,12 +114,28 @@ app.post("/api/sessions/:sessionId/messages", async (req, res) => {
             signal: abortController.signal,
             stopOnAbortSignal: true,
             temperature: typeof temperature === "number" ? temperature : undefined,
-            onToken: (tokens) => {
-                if (firstTokenAt === null) firstTokenAt = Date.now();
-                genTokenCount += tokens.length;
-            },
-            onTextChunk: (text) => {
-                res.write(JSON.stringify({ chunk: text, done: false }) + "\n");
+            topK: typeof topK === "number" ? topK : undefined,
+            topP: typeof topP === "number" ? topP : undefined,
+            minP: typeof minP === "number" ? minP : undefined,
+            mirostat: typeof mirostat === "number" ? mirostat : undefined,
+            mirostatTau: typeof mirostatTau === "number" ? mirostatTau : undefined,
+            mirostatEta: typeof mirostatEta === "number" ? mirostatEta : undefined,
+            repeatPenalty: { penalty: config.repeatPenalty },
+            // onResponseChunk (rather than onTextChunk/onToken) also surfaces "thought"
+            // segments - Gemma 4's thinking-mode output - which the frontend streams
+            // into a collapsible box. It's still the single source of truth for token
+            // counts: onToken excludes thought tokens entirely, which previously made
+            // promptTokens overcount by the size of any hidden thinking when reasoning
+            // was on (thought tokens were generated but never subtracted out below).
+            onResponseChunk: (chunk) => {
+                if (chunk.tokens.length > 0 && firstTokenAt === null) firstTokenAt = Date.now();
+                genTokenCount += chunk.tokens.length;
+
+                if (chunk.type === "segment" && chunk.segmentType === "thought") {
+                    if (chunk.text) res.write(JSON.stringify({ thinkingChunk: chunk.text, done: false }) + "\n");
+                } else if (chunk.type === undefined) {
+                    if (chunk.text) res.write(JSON.stringify({ chunk: chunk.text, done: false }) + "\n");
+                }
             },
         });
 
