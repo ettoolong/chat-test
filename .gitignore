@@ -1,0 +1,5 @@
+.DS_Store
+.claude/
+
+# Model weights are large binaries fetched separately; don't commit them.
+models/*.gguf

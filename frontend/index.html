@@ -1,0 +1,216 @@
+<!doctype html>
+<html lang="zh-Hant">
+  <head>
+    <meta charset="UTF-8" />
+    <link rel="icon" type="image/svg+xml" href="/favicon.svg" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>地端 LLM 聊天 · KV Cache Analyzer</title>
+    <!-- Fonts, markdown rendering, syntax highlighting, and icons are all bundled
+         locally via npm (see src/main.js) instead of loaded from a CDN, so the
+         app works fully offline. -->
+  </head>
+  <body>
+    <div id="app" class="app-container">
+      <!-- Sidebar -->
+      <aside class="sidebar">
+        <div class="sidebar-header">
+          <div class="logo-area">
+            <i data-lucide="zap" class="logo-icon glow-effect"></i>
+            <h1>地端 LLM 聊天</h1>
+          </div>
+          <button id="new-chat-btn" class="btn btn-primary btn-icon" title="開始新對話">
+            <i data-lucide="plus"></i> 新對話
+          </button>
+        </div>
+
+        <!-- Conversations List -->
+        <div class="sidebar-section">
+          <h3>Conversations</h3>
+          <div id="chat-list" class="chat-list">
+            <!-- Dynamically populated chats -->
+          </div>
+        </div>
+
+        <!-- Configuration Settings -->
+        <div class="sidebar-section settings-section">
+          <h3><i data-lucide="settings" class="section-icon"></i> Model Configuration</h3>
+
+          <div class="setting-group">
+            <label>Local Model</label>
+            <div id="model-name-display" class="readonly-field">載入中...</div>
+          </div>
+
+          <div class="setting-group">
+            <label>Context Size</label>
+            <div id="context-size-display" class="readonly-field">-</div>
+          </div>
+
+          <div class="setting-group">
+            <div class="slider-header">
+              <label for="temp-slider">Temperature</label>
+              <span id="temp-val">0.7</span>
+            </div>
+            <input type="range" id="temp-slider" min="0" max="2" step="0.1" value="0.7" />
+          </div>
+        </div>
+
+        <!-- System Prompt (KV Cache) -->
+        <div class="sidebar-section system-prompt-section">
+          <div class="section-title-with-badge">
+            <h3><i data-lucide="terminal" class="section-icon"></i> System Prompt</h3>
+            <span id="cache-status-badge" class="badge badge-inactive">-</span>
+          </div>
+
+          <button id="set-system-prompt-btn" class="btn btn-secondary btn-icon">
+            <i data-lucide="edit-3"></i> Set System Prompt
+          </button>
+
+          <div class="setting-group toggle-group">
+            <label for="use-cache-toggle" title="關閉後，新對話產生 session 時將不套用預先產生的 KV cache，會從頭評估 system prompt，方便比較兩者效能差異">
+              使用預先產生的 KV Cache
+            </label>
+            <label class="switch">
+              <input type="checkbox" id="use-cache-toggle" checked />
+              <span class="switch-slider"></span>
+            </label>
+          </div>
+
+          <div class="cache-info-box">
+            <i data-lucide="info" class="info-icon"></i>
+            <p id="system-prompt-status-text">正在讀取快取狀態...</p>
+          </div>
+        </div>
+
+        <!-- Footer / Info -->
+        <div class="sidebar-footer">
+          <div class="server-status">
+            <span class="status-indicator online" id="server-status-dot"></span>
+            <span id="server-status-text">連線中...</span>
+          </div>
+        </div>
+      </aside>
+
+      <!-- Main Chat Content -->
+      <main class="chat-area">
+        <!-- Top Header Stats Panel -->
+        <header class="chat-header">
+          <div class="header-left">
+            <h2 id="current-chat-title">New Conversation</h2>
+            <span id="active-model-badge" class="model-badge">-</span>
+            <span
+              id="session-cache-badge"
+              class="model-badge cache-indicator"
+              style="display: none"
+              title="這個對話的 session 建立時是否套用了預先產生的 KV cache"
+            ></span>
+          </div>
+
+          <!-- Live KV Cache Metrics -->
+          <div class="metrics-panel">
+            <div class="metric-card" title="這一輪送進模型的 prompt token 數">
+              <span class="metric-label">Prompt Tokens</span>
+              <span id="metric-prompt-tokens" class="metric-value">-</span>
+            </div>
+            <div class="metric-card" title="評估（prefill）prompt 所花費的時間">
+              <span class="metric-label">Prompt Eval Time</span>
+              <span id="metric-eval-time" class="metric-value">-</span>
+            </div>
+            <div
+              class="metric-card"
+              title="Prefill 階段的速度；命中 KV cache 時通常會遠高於一般情況"
+            >
+              <span class="metric-label">Prefill Speed</span>
+              <span id="metric-eval-speed" class="metric-value">-</span>
+            </div>
+            <div class="metric-card" title="生成（decode）階段的速度">
+              <span class="metric-label">Generation Speed</span>
+              <span id="metric-gen-speed" class="metric-value">-</span>
+            </div>
+            <div class="metric-status" id="metric-cache-hit" title="這一輪是否命中 KV cache">
+              <i data-lucide="circle-dashed" class="metric-icon"></i>
+              <span class="status-label">KV Cache</span>
+              <span class="status-val">-</span>
+            </div>
+          </div>
+        </header>
+
+        <!-- Messages View -->
+        <div id="messages-container" class="messages-container">
+          <!-- Welcome Screen -->
+          <div id="welcome-screen" class="welcome-screen">
+            <div class="welcome-card">
+              <i data-lucide="messages-square" class="welcome-icon glow-effect"></i>
+              <h2>地端 LLM 聊天 · KV Cache Analyzer</h2>
+              <p>
+                使用 <code>llama.cpp</code>（透過 node-llama-cpp）在本機執行的聊天介面，
+                展示並驗證 <strong>System Prompt 的 KV Cache 加速效果</strong>。
+              </p>
+
+              <div class="test-guide">
+                <h4>如何測試 KV Cache 效果：</h4>
+                <ol>
+                  <li>
+                    點擊左側 <strong>Set System Prompt</strong>，貼上一段較長的 system prompt
+                    （例如數千字的角色設定或知識庫），儲存後後端會重新產生 KV cache。
+                  </li>
+                  <li>
+                    開啟一個新對話並送出第一則訊息 — 因為 system prompt 已經預先被快取，
+                    這一輪只需要運算你輸入的內容，Prefill Speed 會很快。
+                  </li>
+                  <li>
+                    在同一個對話中繼續發送訊息，之前的對話歷史會留在這個對話自己的 KV cache
+                    中不需要重算，回覆會更快開始生成。
+                  </li>
+                  <li>
+                    再開一個 <strong>新對話</strong> 試試 — 因為套用了同一份 system prompt
+                    cache，一樣不需要重新評估 system prompt。
+                  </li>
+                </ol>
+              </div>
+            </div>
+          </div>
+        </div>
+
+        <!-- Input Area -->
+        <footer class="chat-input-area">
+          <form id="chat-form" class="chat-form">
+            <div class="input-wrapper">
+              <textarea id="user-input" placeholder="輸入訊息..." rows="1" required></textarea>
+              <button type="submit" id="send-btn" class="btn btn-circle btn-primary" title="傳送">
+                <i data-lucide="send"></i>
+              </button>
+            </div>
+          </form>
+          <div class="input-info">
+            <span>按 Enter 傳送，Shift+Enter 換行。由本機 llama.cpp 驅動。</span>
+          </div>
+        </footer>
+      </main>
+    </div>
+
+    <!-- Set System Prompt Modal -->
+    <div id="system-prompt-modal" class="modal-overlay hidden">
+      <div class="modal">
+        <h3><i data-lucide="terminal"></i> Set System Prompt</h3>
+        <p class="modal-desc">
+          這會更新後端儲存的 system prompt，並用它重新產生一份 KV cache
+          供之後所有新對話套用。目前開啟中的對話將會被重置。
+        </p>
+        <textarea
+          id="system-prompt-input"
+          rows="12"
+          placeholder="輸入 system prompt 內容..."
+        ></textarea>
+        <div class="modal-actions">
+          <button id="system-prompt-cancel-btn" class="btn btn-secondary">取消</button>
+          <button id="system-prompt-save-btn" class="btn btn-primary">
+            <i data-lucide="save"></i> 儲存並重建 Cache
+          </button>
+        </div>
+        <div id="system-prompt-modal-status" class="modal-status"></div>
+      </div>
+    </div>
+
+    <script type="module" src="/src/main.js"></script>
+  </body>
+</html>
