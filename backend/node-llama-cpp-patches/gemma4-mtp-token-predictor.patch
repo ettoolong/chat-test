@@ -1,0 +1,406 @@
+diff --git a/llama/addon/AddonContext.cpp b/llama/addon/AddonContext.cpp
+--- a/llama/addon/AddonContext.cpp
++++ b/llama/addon/AddonContext.cpp
+@@ -78,7 +78,140 @@
+         }
+         void OnOK() {
+             deferred.Resolve(Env().Undefined());
++        }
++        void OnError(const Napi::Error& err) {
++            deferred.Reject(err.Value());
++        }
++};
++
++// Runs the Gemma 4 MTP "is_mem_shared" self-speculative draft loop entirely on a worker
++// thread, to avoid the JS<->native round-trip cost of doing this one round at a time
++// from TS (this context's addon methods don't support raw-embedding batch input at all -
++// see the manual `batch.token` allocation below - so this couldn't be assembled from
++// existing per-round JS-callable primitives even if we wanted the loop itself in TS).
++// Mirrors common_speculative_impl_draft_mtp::draft()'s is_mem_shared branch
++// (llama.cpp/common/speculative.cpp): every round re-decodes at the *same* KV position
++// with the (token, h) pair, argmax-samples the next draft token, and reads back that
++// round's `h_nextn` to feed into the next round.
++class AddonContextRunMtpDraftWorker : public Napi::AsyncWorker {
++    public:
++        AddonContext* context;
++        llama_token lastToken;
++        std::vector<float> currentH;
++        llama_pos pos;
++        llama_seq_id seqId;
++        int32_t maxDraftTokens;
++        float minConfidence;
++
++        std::vector<llama_token> resultTokens;
++
++        AddonContextRunMtpDraftWorker(
++            const Napi::CallbackInfo& info, AddonContext* context,
++            llama_token lastToken, std::vector<float> currentH, llama_pos pos, llama_seq_id seqId,
++            int32_t maxDraftTokens, float minConfidence
++        )
++            : Napi::AsyncWorker(info.Env(), "AddonContextRunMtpDraftWorker"),
++              context(context),
++              lastToken(lastToken),
++              currentH(std::move(currentH)),
++              pos(pos),
++              seqId(seqId),
++              maxDraftTokens(maxDraftTokens),
++              minConfidence(minConfidence),
++              deferred(Napi::Promise::Deferred::New(info.Env())) {
++            context->Ref();
++        }
++        ~AddonContextRunMtpDraftWorker() {
++            context->Unref();
++        }
++
++        Napi::Promise GetPromise() {
++            return deferred.Promise();
++        }
++
++    protected:
++        Napi::Promise::Deferred deferred;
++
++        void Execute() {
++            try {
++                // width of the `embd`/h vectors is the *target* model's output hidden size
++                // (llama_model_n_embd_out on the assistant, which mirrors it), not this
++                // model's own working hidden size.
++                const int32_t n_embd = llama_model_n_embd_out(context->model->model);
++                if ((int32_t) currentH.size() != n_embd) {
++                    SetError("pendingH length does not match the model's nextn embedding width");
++                    return;
++                }
++
++                llama_batch draftBatch = llama_batch_init(/*n_tokens_alloc*/ 1, /*embd*/ n_embd, /*n_seq_max*/ 1);
++                // llama_batch_init only allocates one of token/embd - the assistant's graph
++                // consumes both (token for its own embedding lookup, embd for the recurrent
++                // h input), so we manually allocate the other array too, same workaround
++                // used by llama.cpp's own common_speculative_impl_draft_mtp constructor.
++                draftBatch.token = (llama_token*) malloc(sizeof(llama_token) * 1);
++
++                const llama_vocab* vocab = context->model->vocab;
++                const int32_t n_vocab = llama_vocab_n_tokens(vocab);
++
++                llama_token currentToken = lastToken;
++
++                for (int32_t round = 0; round < maxDraftTokens; round++) {
++                    draftBatch.n_tokens = 0;
++                    common_batch_add(draftBatch, currentToken, pos, {seqId}, true);
++                    std::memcpy(draftBatch.embd, currentH.data(), sizeof(float) * n_embd);
++
++                    int decodeResult = llama_decode(context->ctx, draftBatch);
++                    if (decodeResult != 0)
++                        break; // couldn't decode this round - stop drafting, keep what we have so far
++
++                    llama_synchronize(context->ctx);
++
++                    const float* logits = llama_get_logits_ith(context->ctx, 0);
++                    if (logits == nullptr)
++                        break;
++
++                    int32_t bestIndex = 0;
++                    float bestLogit = logits[0];
++                    for (int32_t i = 1; i < n_vocab; i++) {
++                        if (logits[i] > bestLogit) {
++                            bestLogit = logits[i];
++                            bestIndex = i;
++                        }
++                    }
++
++                    if (minConfidence > 0.0f) {
++                        double sumExp = 0.0;
++                        for (int32_t i = 0; i < n_vocab; i++)
++                            sumExp += std::exp((double) (logits[i] - bestLogit));
++                        double bestProb = 1.0 / sumExp;
++
++                        if (bestProb < (double) minConfidence)
++                            break;
++                    }
++
++                    const float* hRow = llama_get_embeddings_nextn_ith(context->ctx, 0);
++                    if (hRow == nullptr)
++                        break;
++
++                    resultTokens.push_back(bestIndex);
++                    currentH.assign(hRow, hRow + n_embd);
++                    currentToken = (llama_token) bestIndex;
++                }
++
++                llama_batch_free(draftBatch);
++            } catch (const std::exception& e) {
++                SetError(e.what());
++            } catch (...) {
++                SetError("Unknown error when running the MTP draft loop");
++            }
+         }
++        void OnOK() {
++            Napi::Uint32Array result = Napi::Uint32Array::New(Env(), resultTokens.size());
++            for (size_t i = 0; i < resultTokens.size(); i++)
++                result[i] = (uint32_t) resultTokens[i];
++
++            deferred.Resolve(result);
++        }
+         void OnError(const Napi::Error& err) {
+             deferred.Reject(err.Value());
+         }
+@@ -819,6 +952,30 @@
+     llama_set_nextn_layer_offset(ctx, offset);
+ 
+     return info.Env().Undefined();
++}
++
++Napi::Value AddonContext::RunMtpDraft(const Napi::CallbackInfo& info) {
++    if (disposed) {
++        Napi::Error::New(info.Env(), "Context is disposed").ThrowAsJavaScriptException();
++        return info.Env().Undefined();
++    }
++
++    llama_token lastToken = (llama_token) info[0].As<Napi::Number>().Uint32Value();
++    Napi::Float64Array pendingH = info[1].As<Napi::Float64Array>();
++    llama_pos pos = (llama_pos) info[2].As<Napi::Number>().Int32Value();
++    llama_seq_id seqId = (llama_seq_id) info[3].As<Napi::Number>().Int32Value();
++    int32_t maxDraftTokens = info[4].As<Napi::Number>().Int32Value();
++    float minConfidence = info[5].As<Napi::Number>().FloatValue();
++
++    std::vector<float> currentH(pendingH.ElementLength());
++    for (size_t i = 0; i < pendingH.ElementLength(); i++)
++        currentH[i] = (float) pendingH[i];
++
++    AddonContextRunMtpDraftWorker* worker = new AddonContextRunMtpDraftWorker(
++        info, this, lastToken, std::move(currentH), pos, seqId, maxDraftTokens, minConfidence
++    );
++    worker->Queue();
++    return worker->GetPromise();
+ }
+ 
+ Napi::Value AddonContext::GetStateSize(const Napi::CallbackInfo& info) {
+@@ -1333,6 +1490,7 @@
+                 InstanceMethod("setEmbeddingsNextn", &AddonContext::SetEmbeddingsNextn),
+                 InstanceMethod("getEmbeddingsNextnIth", &AddonContext::GetEmbeddingsNextnIth),
+                 InstanceMethod("setNextnLayerOffset", &AddonContext::SetNextnLayerOffset),
++                InstanceMethod("runMtpDraft", &AddonContext::RunMtpDraft),
+                 InstanceMethod("getStateSize", &AddonContext::GetStateSize),
+                 InstanceMethod("getMemoryBreakdown", &AddonContext::GetMemoryBreakdown),
+                 InstanceMethod("getThreads", &AddonContext::GetThreads),
+diff --git a/llama/addon/AddonContext.h b/llama/addon/AddonContext.h
+--- a/llama/addon/AddonContext.h
++++ b/llama/addon/AddonContext.h
+@@ -52,6 +52,7 @@
+         Napi::Value SetEmbeddingsNextn(const Napi::CallbackInfo& info);
+         Napi::Value GetEmbeddingsNextnIth(const Napi::CallbackInfo& info);
+         Napi::Value SetNextnLayerOffset(const Napi::CallbackInfo& info);
++        Napi::Value RunMtpDraft(const Napi::CallbackInfo& info);
+         Napi::Value GetStateSize(const Napi::CallbackInfo& info);
+         Napi::Value GetMemoryBreakdown(const Napi::CallbackInfo& info);
+         Napi::Value GetThreads(const Napi::CallbackInfo& info);
+diff --git a/src/bindings/AddonTypes.ts b/src/bindings/AddonTypes.ts
+--- a/src/bindings/AddonTypes.ts
++++ b/src/bindings/AddonTypes.ts
+@@ -192,6 +192,10 @@
+     setEmbeddingsNextn(value: boolean, masked: boolean): void,
+     getEmbeddingsNextnIth(i: number): Float64Array,
+     setNextnLayerOffset(offset: number): void,
++    runMtpDraft(
++        lastToken: number, pendingH: Float64Array, pos: number, seqId: number,
++        maxDraftTokens: number, minConfidence: number
++    ): Promise<Uint32Array>,
+     getStateSize(): number,
+     getMemoryBreakdown(): {
+         cpuRam: number,
+diff --git a/src/evaluator/LlamaContext/TokenPredictor.ts b/src/evaluator/LlamaContext/TokenPredictor.ts
+--- a/src/evaluator/LlamaContext/TokenPredictor.ts
++++ b/src/evaluator/LlamaContext/TokenPredictor.ts
+@@ -32,9 +32,23 @@
+          */
+         evaluateOptions: Readonly<SequenceEvaluateOptions>
+     }): Promise<void> | void;
+-    public abstract pushTokens(tokens: Token[]): void;
++    /**
++     * When set to `true`, `pushTokens` is called with the target model's NextN/MTP hidden state
++     * (`h_nextn`) for the token that was just committed, alongside the token itself.
++     *
++     * Used by predictors that need the target's post-final-norm hidden state to seed their own
++     * drafting (e.g. a Gemma 4 MTP assistant/drafter). Defaults to `false`/unset for predictors
++     * that don't need it, in which case `pushTokens`'s second parameter is always `undefined`.
++     */
++    public needsEmbeddingNextn?: boolean;
+ 
+     /**
++     * @param nextnEmbedding - Only populated when `needsEmbeddingNextn` is `true`: the target's
++     * NextN/MTP hidden state (`h_nextn`) for the last token in `tokens`.
++     */
++    public abstract pushTokens(tokens: Token[], nextnEmbedding?: Float64Array): void;
++
++    /**
+      * Predicts the next tokens based on the current state.
+      *
+      * If the generation should wait until the minimum predications are ready,
+diff --git a/src/evaluator/LlamaContext/LlamaContext.ts b/src/evaluator/LlamaContext/LlamaContext.ts
+--- a/src/evaluator/LlamaContext/LlamaContext.ts
++++ b/src/evaluator/LlamaContext/LlamaContext.ts
+@@ -1072,7 +1072,7 @@
+ }
+ 
+ export class LlamaContextSequence {
+-    /** @internal */ private readonly _sequenceId: number;
++    /** @internal */ public readonly _sequenceId: number;
+     /** @internal */ private readonly _gcRegistry: FinalizationRegistry<number>;
+     /** @internal */ private readonly _context: LlamaContext;
+     /** @internal */ private readonly _contextShift: Required<ContextShiftOptions>;
+@@ -2329,6 +2329,7 @@
+                 this._ensureNotDisposed();
+                 const evaluatorLock = await acquireLock([this._lock, "evaluate"]);
+                 let nextToken: Token | undefined;
++                let nextTokenNextnEmbedding: Float64Array | undefined;
+                 const yieldRes: Partial<SequenceEvaluateOutput<{probabilities: true, confidence: true}>> = {};
+ 
+                 try {
+@@ -2451,11 +2452,14 @@
+                             this._tokenMeter,
+                             contextShiftOptions,
+                             (batchLogitIndex, tokenIndex: number) => {
+-                                if (tokenIndex === logitsStartIndex)
++                                if (tokenIndex === logitsStartIndex) {
+                                     resolvedGrammarEvaluationState = grammarEvaluationState instanceof Function
+                                         ? grammarEvaluationState()
+                                         : grammarEvaluationState;
+-                                else if (tokenIndex === logitsStartIndex + 1)
++
++                                    if (tokenPredictor.needsEmbeddingNextn)
++                                        nextTokenNextnEmbedding = this._context._ctx.getEmbeddingsNextnIth(batchLogitIndex);
++                                } else if (tokenIndex === logitsStartIndex + 1)
+                                     resolvedGrammarEvaluationState = resolvedGrammarEvaluationState?.clone();
+ 
+                                 const samplerConfig = this._resolveSamplerConfig({
+@@ -2557,7 +2561,7 @@
+                     evalTokens = [nextToken];
+ 
+                 if (this._tokenPredictorOwner === tokenPredictorOwner)
+-                    tokenPredictor.pushTokens(evalTokens);
++                    tokenPredictor.pushTokens(evalTokens, nextTokenNextnEmbedding);
+ 
+                 logitsArray = [];
+                 logitsStartIndex = evalTokens.length - 1;
+diff --git a/src/index.ts b/src/index.ts
+--- a/src/index.ts
++++ b/src/index.ts
+@@ -85,6 +85,7 @@
+ import {TokenPredictor} from "./evaluator/LlamaContext/TokenPredictor.js";
+ import {DraftSequenceTokenPredictor} from "./evaluator/LlamaContext/tokenPredictors/DraftSequenceTokenPredictor.js";
+ import {InputLookupTokenPredictor} from "./evaluator/LlamaContext/tokenPredictors/InputLookupTokenPredictor.js";
++import {Gemma4MtpTokenPredictor} from "./evaluator/LlamaContext/tokenPredictors/Gemma4MtpTokenPredictor.js";
+ import {getModuleVersion} from "./utils/getModuleVersion.js";
+ import {readGgufFileInfo} from "./gguf/readGgufFileInfo.js";
+ import {GgufInsights, type GgufInsightsResourceRequirements} from "./gguf/insights/GgufInsights.js";
+@@ -274,6 +275,7 @@
+     TokenPredictor,
+     DraftSequenceTokenPredictor,
+     InputLookupTokenPredictor,
++    Gemma4MtpTokenPredictor,
+     appendUserMessageToChatHistory,
+     getModuleVersion,
+     type ChatHistoryItem,
+diff --git a/src/evaluator/LlamaContext/tokenPredictors/Gemma4MtpTokenPredictor.ts b/src/evaluator/LlamaContext/tokenPredictors/Gemma4MtpTokenPredictor.ts
+new file mode 100644
+--- /dev/null
++++ b/src/evaluator/LlamaContext/tokenPredictors/Gemma4MtpTokenPredictor.ts
+@@ -0,0 +1,100 @@
++import {Token} from "../../../types.js";
++import {TokenPredictor} from "../TokenPredictor.js";
++import {LlamaContextSequence} from "../LlamaContext.js";
++
++const defaultMaxDraftTokens = 3;
++const defaultMinConfidence = 0;
++
++/**
++ * Predicts the next tokens using a Gemma 4 MTP (multi-token prediction) assistant/drafter
++ * model - a small model that cross-attends to the target model's own KV cache and recurrently
++ * proposes candidate continuation tokens from the target's NextN hidden state (`h_nextn`).
++ *
++ * Unlike {@link DraftSequenceTokenPredictor}, the drafter here isn't a full standalone model
++ * generating independently - it's tightly coupled to the target context it was created against
++ * (via the `otherContext` option on `createContext`) and only proposes tokens when it has a
++ * NextN hidden state to seed from, which is only available right after a real token has been
++ * decoded on the target sequence.
++ *
++ * @see [Using Token Predictors: Draft Model Token Predictor](https://node-llama-cpp.withcat.ai/guide/token-prediction#draft-model)
++ */
++export class Gemma4MtpTokenPredictor extends TokenPredictor {
++    /** @internal */ private readonly _mtpSequence: LlamaContextSequence;
++    /** @internal */ private readonly _maxDraftTokens: number;
++    /** @internal */ private readonly _minConfidence: number;
++    /** @internal */ private _embeddingsNextnEnabled: boolean = false;
++    /** @internal */ private _targetSequence?: LlamaContextSequence;
++    /** @internal */ private _lastToken?: Token;
++    /** @internal */ private _pendingH?: Float64Array;
++    /** @internal */ private _disposed: boolean = false;
++
++    public constructor(mtpSequence: LlamaContextSequence, options: {
++        /**
++         * Maximum number of speculative tokens to draft per round.
++         *
++         * Defaults to `3`.
++         */
++        maxDraftTokens?: number,
++
++        /**
++         * Stop drafting further tokens in a round once the drafter's own confidence
++         * (the softmax probability of its top pick) drops below this value.
++         *
++         * Defaults to `0` (disabled - always draft up to `maxDraftTokens`).
++         */
++        minConfidence?: number
++    } = {}) {
++        super();
++
++        this._mtpSequence = mtpSequence;
++        this._maxDraftTokens = options.maxDraftTokens ?? defaultMaxDraftTokens;
++        this._minConfidence = options.minConfidence ?? defaultMinConfidence;
++    }
++
++    public override needsEmbeddingNextn: boolean = true;
++
++    public override reset({targetSequence}: {targetSequence: LlamaContextSequence}) {
++        this._targetSequence = targetSequence;
++        this._lastToken = undefined;
++        this._pendingH = undefined;
++
++        // Enabling this repeatedly across turns is a cheap, idempotent native call - simplest
++        // to just guarantee it's on here rather than relying on external setup code to remember.
++        if (!this._embeddingsNextnEnabled) {
++            this._mtpSequence.context._ctx.setEmbeddingsNextn(true, true);
++            this._embeddingsNextnEnabled = true;
++        }
++    }
++
++    public override pushTokens(tokens: Token[], nextnEmbedding?: Float64Array) {
++        this._lastToken = tokens.at(-1);
++        this._pendingH = nextnEmbedding;
++    }
++
++    public override async predictTokens(): Promise<Token[]> {
++        // No NextN hidden state to seed drafting with yet (e.g. the very first token of a new
++        // generation turn, before any real decode has happened on the target sequence) - skip
++        // drafting for this round rather than trying to invent a seed.
++        if (this._lastToken == null || this._pendingH == null || this._targetSequence == null)
++            return [];
++
++        const draftTokens = await this._mtpSequence.context._ctx.runMtpDraft(
++            this._lastToken,
++            this._pendingH,
++            this._targetSequence.nextTokenIndex,
++            this._mtpSequence._sequenceId,
++            this._maxDraftTokens,
++            this._minConfidence
++        );
++
++        return Array.from(draftTokens) as Token[];
++    }
++
++    public override async dispose() {
++        if (this._disposed)
++            return;
++
++        this._disposed = true;
++        await this._mtpSequence.dispose();
++    }
++}

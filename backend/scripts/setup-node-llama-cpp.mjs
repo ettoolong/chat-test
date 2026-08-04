@@ -6,6 +6,14 @@
 // this app needs native bindings and sampler options that upstream doesn't expose:
 //  - loadStateFromBuffer/saveStateToBuffer - see node-llama-cpp-patches/kv-cache-in-memory-buffer.patch.
 //  - mirostat sampling (v1/v2) - see node-llama-cpp-patches/mirostat-sampling.patch.
+//  - Gemma 4 MTP primitives (ctxType: "mtp" context creation, ctx_other cross-attention,
+//    nextn embedding get/set) - see node-llama-cpp-patches/gemma4-mtp-primitives.patch.
+//  - Gemma 4 MTP token predictor: a native RunMtpDraft addon method (the draft/verify round
+//    loop needs raw-embedding batch input, which no JS-callable primitive supports, and is
+//    performance-sensitive enough to want zero JS<->native round-trips per round) plus the
+//    Gemma4MtpTokenPredictor TS class and TokenPredictor.needsEmbeddingNextn hook that plug
+//    it into the existing speculative-evaluate machinery - see
+//    node-llama-cpp-patches/gemma4-mtp-token-predictor.patch.
 //
 // Requires: git, cmake, and a C++ toolchain (Xcode Command Line Tools on macOS) already
 // installed - this script only handles the node-llama-cpp side of the build.
@@ -19,6 +27,8 @@ const targetDir = path.join(backendRoot, "node-llama-cpp-src");
 const patchFiles = [
     path.join(backendRoot, "node-llama-cpp-patches", "kv-cache-in-memory-buffer.patch"),
     path.join(backendRoot, "node-llama-cpp-patches", "mirostat-sampling.patch"),
+    path.join(backendRoot, "node-llama-cpp-patches", "gemma4-mtp-primitives.patch"),
+    path.join(backendRoot, "node-llama-cpp-patches", "gemma4-mtp-token-predictor.patch"),
 ];
 
 const NODE_LLAMA_CPP_REPO = "https://github.com/withcatai/node-llama-cpp.git";
@@ -55,8 +65,10 @@ run("git", [
     NODE_LLAMA_CPP_REPO, targetDir,
 ]);
 
-// Applied in order: mirostat-sampling.patch was captured as an incremental diff on top
-// of kv-cache-in-memory-buffer.patch, so it must be applied second.
+// Applied in order: each patch was captured as an incremental diff on top of the ones
+// before it (mirostat-sampling.patch on top of kv-cache-in-memory-buffer.patch,
+// gemma4-mtp-primitives.patch on top of both, gemma4-mtp-token-predictor.patch on top of
+// all three), so this order must be preserved.
 for (const patchFile of patchFiles) {
     console.log(`> git apply ${patchFile}`);
     run("git", ["apply", patchFile], { cwd: targetDir });
@@ -83,6 +95,7 @@ fs.writeFileSync(pkgJsonPath, `${JSON.stringify(pkg, null, 2)}\n`);
 run("npm", ["prune"], { cwd: targetDir });
 
 console.log(
-    "\nDone. node-llama-cpp-src is built with the in-memory KV-cache and mirostat-sampling patches applied.\n" +
+    "\nDone. node-llama-cpp-src is built with the in-memory KV-cache, mirostat-sampling, " +
+    "gemma4-mtp-primitives, and gemma4-mtp-token-predictor patches applied.\n" +
     "Next: run `npm install` in backend/ so node-llama-cpp resolves to this local build."
 );

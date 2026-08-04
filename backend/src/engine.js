@@ -7,6 +7,8 @@ import { config } from "./config.js";
 let llama = null;
 let model = null;
 let context = null;
+let assistantModel = null; // Gemma 4 MTP drafter model, only loaded when config.mtpEnabled
+let mtpContext = null; // ctxType: "mtp" context cross-attending `context`, only created when config.mtpEnabled
 let systemPrompt = "";
 let cacheStats = null; // { thinking: {promptTokens, prefillMs, cacheSizeBytes}, noThinking: {...}, generatedAt }
 // { buffer, tokens } per thinking mode - held in RAM so createSession never re-reads it from disk
@@ -135,6 +137,38 @@ async function warmInMemoryCache() {
     }
 }
 
+/**
+ * Loads the Gemma 4 MTP assistant/drafter model and creates its `ctxType: "mtp"` context,
+ * cross-attending the already-initialized target `context` via `otherContext` (required by
+ * the assistant's architecture - see Gemma4Assistant's `ctx_other` requirement). Also enables
+ * NextN hidden-state extraction on the target context, since the drafter needs `h_nextn` for
+ * every real token the target decodes from here on.
+ *
+ * Must run after `context` is fully created - `otherContext` captures the target's native
+ * context pointer at MTP-context-construction time, so the target has to already be `.init()`-ed.
+ */
+async function initMtpDrafter() {
+    if (!fs.existsSync(config.mtpModelPath)) {
+        throw new Error(
+            `MTP drafter model file not found at: ${config.mtpModelPath}\n` +
+            `Place the converted Gemma 4 assistant GGUF there, set MTP_MODEL_PATH, or set MTP_DRAFT_ENABLED=false.`
+        );
+    }
+
+    console.log(`[Engine] Loading MTP drafter model: ${config.mtpModelPath}`);
+    assistantModel = await llama.loadModel({ modelPath: config.mtpModelPath });
+
+    console.log(`[Engine] Creating MTP context (sequences=${config.maxSessions})`);
+    mtpContext = await assistantModel.createContext({
+        contextSize: config.contextSize,
+        sequences: config.maxSessions,
+        ctxType: "mtp",
+        otherContext: context,
+    });
+
+    context._ctx.setEmbeddingsNextn(true, false);
+}
+
 export async function initEngine() {
     if (!fs.existsSync(config.modelPath)) {
         throw new Error(
@@ -156,6 +190,10 @@ export async function initEngine() {
         contextSize: config.contextSize,
         sequences: config.maxSessions,
     });
+
+    if (config.mtpEnabled) {
+        await initMtpDrafter();
+    }
 
     if (!isCacheValid()) {
         await generateSystemPromptCache();
@@ -193,6 +231,10 @@ export function getModel() {
 
 export function getContext() {
     return context;
+}
+
+export function getMtpContext() {
+    return mtpContext;
 }
 
 export function getCachedState(thinking) {

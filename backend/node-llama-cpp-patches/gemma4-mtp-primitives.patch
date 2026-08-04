@@ -1,0 +1,301 @@
+diff --git a/llama/addon/AddonModel.cpp b/llama/addon/AddonModel.cpp
+--- a/llama/addon/AddonModel.cpp
++++ b/llama/addon/AddonModel.cpp
+@@ -640,6 +640,15 @@
+     }
+ 
+     return Napi::Number::From(info.Env(), llama_model_size(model));
++}
++
++Napi::Value AddonModel::GetNLayerNextn(const Napi::CallbackInfo& info) {
++    if (disposed) {
++        Napi::Error::New(info.Env(), "Model is disposed").ThrowAsJavaScriptException();
++        return info.Env().Undefined();
++    }
++
++    return Napi::Number::From(info.Env(), llama_model_n_layer_nextn(model));
+ }
+ 
+ Napi::Value AddonModel::GetTotalParameters(const Napi::CallbackInfo& info) {
+@@ -856,6 +865,7 @@
+                 InstanceMethod("detokenize", &AddonModel::Detokenize),
+                 InstanceMethod("getTrainContextSize", &AddonModel::GetTrainContextSize),
+                 InstanceMethod("getEmbeddingVectorSize", &AddonModel::GetEmbeddingVectorSize),
++                InstanceMethod("getNLayerNextn", &AddonModel::GetNLayerNextn),
+                 InstanceMethod("getTotalSize", &AddonModel::GetTotalSize),
+                 InstanceMethod("getTotalParameters", &AddonModel::GetTotalParameters),
+                 InstanceMethod("getModelDescription", &AddonModel::GetModelDescription),
+diff --git a/llama/addon/AddonModel.h b/llama/addon/AddonModel.h
+--- a/llama/addon/AddonModel.h
++++ b/llama/addon/AddonModel.h
+@@ -50,6 +50,7 @@
+         Napi::Value Detokenize(const Napi::CallbackInfo& info);
+         Napi::Value GetTrainContextSize(const Napi::CallbackInfo& info);
+         Napi::Value GetEmbeddingVectorSize(const Napi::CallbackInfo& info);
++        Napi::Value GetNLayerNextn(const Napi::CallbackInfo& info);
+         Napi::Value GetTotalSize(const Napi::CallbackInfo& info);
+         Napi::Value GetTotalParameters(const Napi::CallbackInfo& info);
+         Napi::Value GetModelDescription(const Napi::CallbackInfo& info);
+diff --git a/llama/addon/AddonContext.cpp b/llama/addon/AddonContext.cpp
+--- a/llama/addon/AddonContext.cpp
++++ b/llama/addon/AddonContext.cpp
+@@ -4,6 +4,7 @@
+ #include "common/common.h"
+ #include "llama-context.h"
+ #include "llama-vocab.h"
++#include "llama-ext.h"
+ #include "llama.h"
+ 
+ #include "addonGlobals.h"
+@@ -436,6 +437,23 @@
+ 
+         if (options.Has("swaFullCache")) {
+             context_params.swa_full = options.Get("swaFullCache").As<Napi::Boolean>().Value();
++        }
++
++        if (options.Has("ctxType")) {
++            const auto ctxType = options.Get("ctxType").As<Napi::String>().Utf8Value();
++            if (ctxType == "mtp") {
++                context_params.ctx_type = LLAMA_CONTEXT_TYPE_MTP;
++            }
++        }
++
++        // Some architectures (e.g. Gemma 4's MTP assistant/drafter) build a graph that
++        // cross-attends to another, already-initialized context's KV cache (typically the
++        // target context this draft context will run alongside). That other context must
++        // already have completed its own `.init()` call before this constructor runs, since
++        // `ctx_other` is captured here by value, not re-read later.
++        if (options.Has("otherContext")) {
++            AddonContext* otherContext = Napi::ObjectWrap<AddonContext>::Unwrap(options.Get("otherContext").As<Napi::Object>());
++            context_params.ctx_other = otherContext->ctx;
+         }
+     }
+ }
+@@ -747,11 +765,62 @@
+     Napi::Float64Array result = Napi::Float64Array::New(info.Env(), resultSize);
+     for (size_t i = 0; i < resultSize; i++) {
+         result[i] = embeddings[i];
++    }
++
++    return result;
++}
++
++Napi::Value AddonContext::SetEmbeddingsNextn(const Napi::CallbackInfo& info) {
++    if (disposed) {
++        Napi::Error::New(info.Env(), "Context is disposed").ThrowAsJavaScriptException();
++        return info.Env().Undefined();
++    }
++
++    const bool value = info[0].As<Napi::Boolean>().Value();
++    const bool masked = info[1].As<Napi::Boolean>().Value();
++
++    llama_set_embeddings_nextn(ctx, value, masked);
++
++    return info.Env().Undefined();
++}
++
++Napi::Value AddonContext::GetEmbeddingsNextnIth(const Napi::CallbackInfo& info) {
++    if (disposed) {
++        Napi::Error::New(info.Env(), "Context is disposed").ThrowAsJavaScriptException();
++        return info.Env().Undefined();
+     }
+ 
++    int32_t i = info[0].As<Napi::Number>().Int32Value();
++
++    const int n_embd = llama_model_n_embd(model->model);
++    const auto* embeddings = llama_get_embeddings_nextn_ith(ctx, i);
++
++    if (embeddings == NULL) {
++        Napi::Error::New(info.Env(), std::string("Failed to get nextn embeddings for token ") + std::to_string(i)).ThrowAsJavaScriptException();
++        return info.Env().Undefined();
++    }
++
++    Napi::Float64Array result = Napi::Float64Array::New(info.Env(), n_embd);
++    for (int j = 0; j < n_embd; j++) {
++        result[j] = embeddings[j];
++    }
++
+     return result;
+ }
+ 
++Napi::Value AddonContext::SetNextnLayerOffset(const Napi::CallbackInfo& info) {
++    if (disposed) {
++        Napi::Error::New(info.Env(), "Context is disposed").ThrowAsJavaScriptException();
++        return info.Env().Undefined();
++    }
++
++    int32_t offset = info[0].As<Napi::Number>().Int32Value();
++
++    llama_set_nextn_layer_offset(ctx, offset);
++
++    return info.Env().Undefined();
++}
++
+ Napi::Value AddonContext::GetStateSize(const Napi::CallbackInfo& info) {
+     if (disposed) {
+         Napi::Error::New(info.Env(), "Context is disposed").ThrowAsJavaScriptException();
+@@ -1261,6 +1330,9 @@
+                 InstanceMethod("decodeBatch", &AddonContext::DecodeBatch),
+                 InstanceMethod("sampleToken", &AddonContext::SampleToken),
+                 InstanceMethod("getEmbedding", &AddonContext::GetEmbedding),
++                InstanceMethod("setEmbeddingsNextn", &AddonContext::SetEmbeddingsNextn),
++                InstanceMethod("getEmbeddingsNextnIth", &AddonContext::GetEmbeddingsNextnIth),
++                InstanceMethod("setNextnLayerOffset", &AddonContext::SetNextnLayerOffset),
+                 InstanceMethod("getStateSize", &AddonContext::GetStateSize),
+                 InstanceMethod("getMemoryBreakdown", &AddonContext::GetMemoryBreakdown),
+                 InstanceMethod("getThreads", &AddonContext::GetThreads),
+diff --git a/llama/addon/AddonContext.h b/llama/addon/AddonContext.h
+--- a/llama/addon/AddonContext.h
++++ b/llama/addon/AddonContext.h
+@@ -49,6 +49,9 @@
+         Napi::Value SampleToken(const Napi::CallbackInfo& info);
+ 
+         Napi::Value GetEmbedding(const Napi::CallbackInfo& info);
++        Napi::Value SetEmbeddingsNextn(const Napi::CallbackInfo& info);
++        Napi::Value GetEmbeddingsNextnIth(const Napi::CallbackInfo& info);
++        Napi::Value SetNextnLayerOffset(const Napi::CallbackInfo& info);
+         Napi::Value GetStateSize(const Napi::CallbackInfo& info);
+         Napi::Value GetMemoryBreakdown(const Napi::CallbackInfo& info);
+         Napi::Value GetThreads(const Napi::CallbackInfo& info);
+diff --git a/src/bindings/AddonTypes.ts b/src/bindings/AddonTypes.ts
+--- a/src/bindings/AddonTypes.ts
++++ b/src/bindings/AddonTypes.ts
+@@ -24,7 +24,14 @@
+     performanceTracking?: boolean,
+     kvCacheKeyType?: number,
+     kvCacheValueType?: number,
+-    swaFullCache?: boolean
++    swaFullCache?: boolean,
++    ctxType?: "default" | "mtp",
++    /**
++     * Another, already-`init()`-ed `AddonContext` this context's model architecture cross-attends to
++     * (e.g. an MTP/NextN drafter context needs its target context here). Must be passed after the
++     * other context has finished initializing.
++     */
++    otherContext?: AddonContext
+ };
+ 
+ export type BindingModule = {
+@@ -127,6 +134,7 @@
+     detokenize(tokens: Uint32Array, specialTokens?: boolean): string,
+     getTrainContextSize(): number,
+     getEmbeddingVectorSize(): number,
++    getNLayerNextn(): number,
+     getTotalSize(): number,
+     getTotalParameters(): number,
+     getModelDescription(): ModelTypeDescription,
+@@ -181,6 +189,9 @@
+     getSequenceKvCacheMinPosition(sequenceId: number): number,
+     getSequenceKvCacheMaxPosition(sequenceId: number): number,
+     getEmbedding(inputTokensLength: number, maxVectorSize?: number): Float64Array,
++    setEmbeddingsNextn(value: boolean, masked: boolean): void,
++    getEmbeddingsNextnIth(i: number): Float64Array,
++    setNextnLayerOffset(offset: number): void,
+     getStateSize(): number,
+     getMemoryBreakdown(): {
+         cpuRam: number,
+diff --git a/src/evaluator/LlamaModel/LlamaModel.ts b/src/evaluator/LlamaModel/LlamaModel.ts
+--- a/src/evaluator/LlamaModel/LlamaModel.ts
++++ b/src/evaluator/LlamaModel/LlamaModel.ts
+@@ -233,6 +233,7 @@
+     /** @internal */ private _typeDescription?: ModelTypeDescription;
+     /** @internal */ private _trainContextSize?: number;
+     /** @internal */ private _embeddingVectorSize?: number;
++    /** @internal */ private _nLayerNextn?: number;
+     /** @internal */ private _vocabularyType?: LlamaVocabularyType;
+ 
+     public readonly tokenizer: Tokenizer;
+@@ -735,6 +736,16 @@
+         return this._embeddingVectorSize;
+     }
+ 
++    /** The number of MTP/NextN draft layers this model carries (0 if it has none) */
++    public get nLayerNextn(): number {
++        this._ensureNotDisposed();
++
++        if (this._nLayerNextn == null)
++            this._nLayerNextn = this._model.getNLayerNextn();
++
++        return this._nLayerNextn;
++    }
++
+     public get vocabularyType(): LlamaVocabularyType {
+         this._ensureNotDisposed();
+ 
+diff --git a/src/evaluator/LlamaContext/types.ts b/src/evaluator/LlamaContext/types.ts
+--- a/src/evaluator/LlamaContext/types.ts
++++ b/src/evaluator/LlamaContext/types.ts
+@@ -3,7 +3,7 @@
+ import type {LlamaGrammarEvaluationState} from "../LlamaGrammarEvaluationState.js";
+ import type {TokenBias} from "../TokenBias.js";
+ import type {Token} from "../../types.js";
+-import type {LlamaContextSequence} from "./LlamaContext.js";
++import type {LlamaContext, LlamaContextSequence} from "./LlamaContext.js";
+ 
+ 
+ export type LlamaContextOptions = {
+@@ -150,6 +150,25 @@
+     swaFullCache?: boolean,
+ 
+     /**
++     * Advanced option to select the native `llama_context` type to create.
++     *
++     * `"mtp"` creates a context of type `LLAMA_CONTEXT_TYPE_MTP`, used to run a model's MTP/NextN draft head
++     * (e.g. a Gemma 4 assistant/drafter checkpoint) - the model must have been converted with its MTP layers
++     * for this to succeed (check `model.nLayerNextn > 0` first).
++     *
++     * Defaults to `"default"`.
++     */
++    ctxType?: "default" | "mtp",
++
++    /**
++     * Another, already-created context this context's model architecture cross-attends to
++     * (e.g. a Gemma 4 MTP/NextN drafter context needs its target context here).
++     *
++     * The other context must finish being created (i.e. be `await`-ed) before this context is created.
++     */
++    otherContext?: LlamaContext,
++
++    /**
+      * Load the provided LoRA adapters onto the context.
+      * LoRA adapters are used to modify the weights of a pretrained model to adapt to new tasks or domains
+      * without the need for extensive retraining from scratch.
+diff --git a/src/evaluator/LlamaContext/LlamaContext.ts b/src/evaluator/LlamaContext/LlamaContext.ts
+--- a/src/evaluator/LlamaContext/LlamaContext.ts
++++ b/src/evaluator/LlamaContext/LlamaContext.ts
+@@ -82,6 +82,7 @@
+     /** @internal */ private readonly _unusedSequenceIds: number[] = [];
+     /** @internal */ private readonly _batchingOptions: Required<BatchingOptions>;
+     /** @internal */ public readonly _swaFullCache: boolean = false;
++    /** @internal */ private readonly _ctxType?: "default" | "mtp";
+     /** @internal */ private readonly _queuedDecodeSequenceIds = new Set<number>();
+     /** @internal */ private readonly _queuedDecodes: InternalQueuedDecode[] = [];
+     /** @internal */ private readonly _disposeAggregator = new AsyncDisposeAggregator();
+@@ -118,6 +119,8 @@
+         performanceTracking = false,
+         experimentalKvCacheKeyType,
+         experimentalKvCacheValueType,
++        ctxType,
++        otherContext,
+         _embeddings,
+         _ranking
+     }: LlamaContextOptions & {
+@@ -158,6 +161,7 @@
+         this._kvCacheKeyType = experimentalKvCacheKeyType;
+         this._kvCacheValueType = experimentalKvCacheValueType;
+         this._swaFullCache = !!swaFullCache;
++        this._ctxType = ctxType;
+         this._ctx = new this._llama._bindings.AddonContext(this._model._model, removeNullFields({
+             contextSize: padSafeContextSize(this._contextSize * this._totalSequences, "up"), // each sequence needs its own <contextSize> of cells
+             batchSize: this._batchSize + (
+@@ -175,7 +179,9 @@
+             performanceTracking: this._performanceTracking,
+             kvCacheKeyType: this._kvCacheKeyType,
+             kvCacheValueType: this._kvCacheValueType,
+-            swaFullCache: this._swaFullCache
++            swaFullCache: this._swaFullCache,
++            ctxType: this._ctxType,
++            otherContext: otherContext?._ctx
+         }));
+         this._batchingOptions = {
+             dispatchSchedule: batchingDispatchSchedule,

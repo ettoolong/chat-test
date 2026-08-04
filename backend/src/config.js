@@ -18,6 +18,13 @@ function envInt(name, fallback) {
     return Number.isFinite(n) ? n : fallback;
 }
 
+function envFloat(name, fallback) {
+    const raw = process.env[name];
+    if (raw === undefined || raw === "") return fallback;
+    const n = Number.parseFloat(raw);
+    return Number.isFinite(n) ? n : fallback;
+}
+
 export const config = {
     port: envInt("PORT", 3001),
     corsOrigin: process.env.CORS_ORIGIN || "http://localhost:5173",
@@ -43,6 +50,22 @@ export const config = {
     // Not exposed in the UI - applied to every generation regardless of the other
     // sampling settings the user picks.
     repeatPenalty: 1.1,
+
+    // Gemma 4 MTP (multi-token prediction) self-speculative decoding. Off by default -
+    // opt in per deployment/benchmark run. Mirostat sampling has no effect on sessions
+    // created while this is on (the underlying tokenPredictor evaluation path doesn't
+    // carry mirostat options through - a pre-existing node-llama-cpp limitation that
+    // applies to every token predictor, not something specific to this feature).
+    mtpEnabled: process.env.MTP_DRAFT_ENABLED === "true",
+
+    mtpModelPath: process.env.MTP_MODEL_PATH
+        ? path.resolve(process.env.MTP_MODEL_PATH)
+        : path.join(projectRoot, "models", "gemma-4-E4B-it-assistant-F16.gguf"),
+
+    // Max speculative tokens proposed per round, and the confidence cutoff (drafter's own
+    // top-pick probability) below which drafting stops early for that round.
+    mtpMaxDraftTokens: envInt("MTP_MAX_DRAFT_TOKENS", 3),
+    mtpMinConfidence: envFloat("MTP_MIN_CONFIDENCE", 0),
 
     systemPromptFile: process.env.SYSTEM_PROMPT_FILE
         ? path.resolve(process.env.SYSTEM_PROMPT_FILE)

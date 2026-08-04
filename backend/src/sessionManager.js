@@ -1,7 +1,7 @@
 import crypto from "node:crypto";
-import { LlamaChatSession, Gemma4ChatWrapper } from "node-llama-cpp";
+import { LlamaChatSession, Gemma4ChatWrapper, Gemma4MtpTokenPredictor } from "node-llama-cpp";
 import { config } from "./config.js";
-import { getContext, getSystemPrompt, getCachedState } from "./engine.js";
+import { getContext, getMtpContext, getSystemPrompt, getCachedState } from "./engine.js";
 
 /** @type {Map<string, {session: LlamaChatSession, lastUsed: number, busy: boolean}>} */
 const sessions = new Map();
@@ -57,7 +57,19 @@ export async function createSession(useCache = true, history = undefined, thinki
         }
     }
 
-    const sequence = context.getSequence();
+    // MTP-enabled sessions get a dedicated draft sequence on the MTP context, paired 1:1 with
+    // this session's target sequence. Mirostat sampling silently has no effect on these sessions
+    // (see config.js) - a pre-existing node-llama-cpp limitation for any tokenPredictor, not
+    // something specific to this feature.
+    const mtpContext = getMtpContext();
+    const sequence = mtpContext
+        ? context.getSequence({
+            tokenPredictor: new Gemma4MtpTokenPredictor(mtpContext.getSequence(), {
+                maxDraftTokens: config.mtpMaxDraftTokens,
+                minConfidence: config.mtpMinConfidence,
+            }),
+        })
+        : context.getSequence();
 
     if (useCache) {
         const { buffer, tokens } = getCachedState(thinking);
