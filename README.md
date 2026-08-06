@@ -132,6 +132,7 @@ bundle，`index.html` 沒有任何指向 CDN 的 `<link>`/`<script>`。後端本
 
 ```bash
 cd backend
+npm run setup:node-llama-cpp
 npm install
 npm run dev   # 或 npm start
 ```
