@@ -1,7 +1,7 @@
 import express from "express";
 import cors from "cors";
 import { config } from "./config.js";
-import { initEngine, getSystemPrompt, getCacheStats, getModelInfo, updateSystemPrompt } from "./engine.js";
+import { initEngine, getSystemPrompt, getCacheStats, getModelInfo, updateSystemPrompt, getContext } from "./engine.js";
 import {
     createSession,
     getSession,
@@ -87,6 +87,24 @@ app.post("/api/sessions/:sessionId/messages", async (req, res) => {
         return res.status(409).json({ error: "This session is already generating a response" });
     }
 
+    const sequence = entry.session.sequence;
+    const newMessageTokens = entry.session.model.tokenize(message).length;
+    // What's left in this sequence's context after what's already resident (system prompt +
+    // prior turns), minus a slack for the chat template's own per-turn control tokens and a
+    // reserve so the model actually has room to generate a reply. Without this check, a message
+    // that doesn't fit gets silently mangled by node-llama-cpp's default context-shift strategy
+    // instead of erroring: on a session's first turn there's no earlier model response yet for
+    // it to trim, so it ends up truncating - potentially down to nothing - the new message itself.
+    const availableTokens =
+        getContext().contextSize - sequence.nextTokenIndex - config.chatTemplateSlackTokens - config.minResponseReserveTokens;
+    if (newMessageTokens > availableTokens) {
+        return res.status(400).json({
+            error:
+                `Message too long: needs ${newMessageTokens} tokens but only ${Math.max(0, availableTokens)} ` +
+                "remain in this session's context. Start a new conversation or shorten the message.",
+        });
+    }
+
     res.setHeader("Content-Type", "application/x-ndjson");
     res.setHeader("Cache-Control", "no-cache");
     res.setHeader("Connection", "keep-alive");
@@ -100,7 +118,6 @@ app.post("/api/sessions/:sessionId/messages", async (req, res) => {
         if (!responseFinished) abortController.abort();
     });
 
-    const sequence = entry.session.sequence;
     const tokensBefore = sequence.nextTokenIndex;
     const t0 = Date.now();
     let firstTokenAt = null;
@@ -145,7 +162,13 @@ app.post("/api/sessions/:sessionId/messages", async (req, res) => {
         const promptTokens = Math.max(0, sequence.nextTokenIndex - tokensBefore - genTokenCount);
         const prefillSpeed = promptEvalDurationMs > 0 ? promptTokens / (promptEvalDurationMs / 1000) : 0;
         const genSpeed = genDurationMs > 0 ? genTokenCount / (genDurationMs / 1000) : 0;
-        const cacheHit = promptTokens === 0 || prefillSpeed > config.cacheHitPrefillThreshold;
+        // A real hit only evaluates this turn's own content: the user's message plus a
+        // handful of chat-template control tokens (turn markers, response-start marker).
+        // A real miss re-evaluates the whole system prompt on top of that, so promptTokens
+        // for a miss is thousands of tokens larger than the message itself - comparing
+        // against the message's own tokenized length (rather than a fraction of the system
+        // prompt's size) stays correct even for a long pasted message on a genuine hit.
+        const cacheHit = promptTokens <= newMessageTokens + config.chatTemplateSlackTokens;
 
         res.write(
             JSON.stringify({

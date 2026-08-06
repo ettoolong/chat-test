@@ -76,6 +76,15 @@ KV cache 重用有幾個層面的限制，不是萬用的加速手段：
    shift（預設策略是抹掉最早的回覆、保留最前面的 system prompt），被抹掉的部分下次
    要重新計算，快取加速的效果會隨對話變長而遞減。
 
+   這個預設策略是設計來刪「已經存在的舊回覆」的，在 session 的**第一輪**對話裡
+   還沒有任何舊回覆可刪——如果系統 prompt 已經吃掉大半個 `contextSize`（例如很長的
+   角色設定/世界觀文件），這時使用者傳一則夠長的訊息進來，會讓策略誤把「這則正要
+   處理的新訊息本身」當成可以刪減的舊內容，一路截短甚至整段砍光，且不會報錯——
+   模型只會憑系統 prompt 生出一句文不對題的回覆。`backend/src/server.js` 已經加了
+   明確的長度檢查（在真的呼叫 `session.prompt()` 之前，用
+   `entry.session.model.tokenize()` 算出這則訊息的 token 數，跟這個 session
+   剩餘的 context 空間比較），放不下就直接回傳 `400`，不會讓訊息被默默吃掉。
+
 **不算限制的部分**：temperature / top-p / top-k / min-p / mirostat / repeat penalty
 等取樣參數**不影響** KV cache——它們只影響「算完 K/V 之後怎麼挑下一個 token」，不影響
 K/V 本身的計算結果，可以每次請求自由調整而不會讓 cache 失效（這也是前端 Sampling

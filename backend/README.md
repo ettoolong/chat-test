@@ -42,7 +42,7 @@ the cache on next start.
 | GET    | `/api/system-prompt`          | -                           | Current system prompt + its cache stats (`{ systemPrompt, cache }`) |
 | POST   | `/api/system-prompt`          | `{ systemPrompt: string }`  | Persists a new system prompt, disposes all live sessions, and rebuilds the KV cache from it. Returns `{ ok, cache }` |
 | POST   | `/api/sessions`                | -                           | Create a chat session (loads the cached system-prompt KV state onto a fresh sequence). Returns `{ sessionId }` |
-| POST   | `/api/sessions/:id/messages`   | `{ message: string, temperature?: number }` | Streams the reply as newline-delimited JSON (`{chunk, done}` lines, `application/x-ndjson`); the final line is `{done: true, stats: {promptTokens, promptEvalDurationMs, genTokenCount, genDurationMs, prefillSpeed, genSpeed, cacheHit}}` |
+| POST   | `/api/sessions/:id/messages`   | `{ message: string, temperature?: number }` | Streams the reply as newline-delimited JSON (`{chunk, done}` lines, `application/x-ndjson`); the final line is `{done: true, stats: {promptTokens, promptEvalDurationMs, genTokenCount, genDurationMs, prefillSpeed, genSpeed, cacheHit}}`. Returns a plain (non-streamed) `400` if the message doesn't fit in what's left of the session's context (`MIN_RESPONSE_RESERVE_TOKENS`, default 256, is kept free for the reply) - see the KV cache limits section in the root README for why this check exists. |
 | DELETE | `/api/sessions/:id`            | -                           | Frees the session's sequence slot |
 
 Concurrent sessions are capped by `MAX_SESSIONS` (default 3) since each one
@@ -50,8 +50,13 @@ holds its own KV-cache sequence; idle sessions are reclaimed automatically
 (`SESSION_IDLE_TIMEOUT_MS`), and the oldest idle session is evicted if a new
 one is requested while at capacity.
 
-`stats.cacheHit` is a heuristic: a per-message prefill speed above
-`CACHE_HIT_PREFILL_THRESHOLD` (default 300 tokens/sec) is reported as a hit.
+`stats.cacheHit` is deterministic, not timing-based: a per-message `promptTokens`
+count no larger than the message's own tokenized length (plus
+`CHAT_TEMPLATE_SLACK_TOKENS`, default 32, for the chat template's per-turn
+control tokens) is reported as a hit - a real hit only evaluates the new turn,
+while a real miss re-evaluates the whole system prompt on top of that, so
+`promptTokens` lands far above the message's own length regardless of hardware
+speed.
 Updating the system prompt via `POST /api/system-prompt` disposes every live
 session (they're bound to the now-stale cache), so any open frontend
 conversations will lazily start a fresh session on their next message.

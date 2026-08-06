@@ -36,9 +36,17 @@ export const config = {
     // Idle sessions get their sequence reclaimed after this long without a message.
     sessionIdleTimeoutMs: envInt("SESSION_IDLE_TIMEOUT_MS", 30 * 60 * 1000),
 
-    // A per-message prefill speed (tokens/sec) above this is reported as a KV-cache hit
-    // in the chat metrics. Heuristic - tune to taste for your hardware.
-    cacheHitPrefillThreshold: envInt("CACHE_HIT_PREFILL_THRESHOLD", 300),
+    // Slack added on top of the current message's own tokenized length when deciding
+    // whether a message's promptTokens count reflects a KV-cache hit - covers the chat
+    // template's per-turn control tokens (turn markers, response-start marker) that get
+    // evaluated alongside the message itself even on a genuine hit.
+    chatTemplateSlackTokens: envInt("CHAT_TEMPLATE_SLACK_TOKENS", 32),
+
+    // Tokens reserved for the model's reply when checking whether an incoming message fits
+    // in what's left of the session's context. Without this, a message could be accepted
+    // because it just barely fits alongside what's already resident, leaving the model no
+    // room to actually generate a response.
+    minResponseReserveTokens: envInt("MIN_RESPONSE_RESERVE_TOKENS", 256),
 
     // Not exposed in the UI - applied to every generation regardless of the other
     // sampling settings the user picks.
