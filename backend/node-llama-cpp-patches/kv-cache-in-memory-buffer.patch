@@ -1,8 +1,8 @@
 diff --git a/llama/addon/AddonContext.cpp b/llama/addon/AddonContext.cpp
-index 9427e8f..15a4dc0 100644
+index b4cb759..32a5f9d 100644
 --- a/llama/addon/AddonContext.cpp
 +++ b/llama/addon/AddonContext.cpp
-@@ -968,6 +968,130 @@ Napi::Value AddonContext::LoadSequenceStateFromFile(const Napi::CallbackInfo& in
+@@ -1201,6 +1201,130 @@ Napi::Value AddonContext::LoadSequenceStateFromFile(const Napi::CallbackInfo& in
      return worker->GetPromise();
  }
  
@@ -133,7 +133,7 @@ index 9427e8f..15a4dc0 100644
  Napi::Value AddonContext::PrintTimings(const Napi::CallbackInfo& info) {
      llama_perf_context_print(ctx);
      llama_perf_context_reset(ctx);
-@@ -1145,6 +1269,8 @@ void AddonContext::init(Napi::Object exports) {
+@@ -1484,6 +1608,8 @@ void AddonContext::init(Napi::Object exports) {
                  InstanceMethod("ensureDraftContextIsCompatibleForSpeculative", &AddonContext::EnsureDraftContextIsCompatibleForSpeculative),
                  InstanceMethod("saveSequenceStateToFile", &AddonContext::SaveSequenceStateToFile),
                  InstanceMethod("loadSequenceStateFromFile", &AddonContext::LoadSequenceStateFromFile),
@@ -141,12 +141,12 @@ index 9427e8f..15a4dc0 100644
 +                InstanceMethod("loadSequenceStateFromBuffer", &AddonContext::LoadSequenceStateFromBuffer),
                  InstanceMethod("setLoras", &AddonContext::SetLoras),
                  InstanceMethod("restoreCheckpoint", &AddonContext::RestoreCheckpoint),
-                 InstanceMethod("dispose", &AddonContext::Dispose),
+                 InstanceMethod("copySequenceStateFromOtherSequence", &AddonContext::CopySequenceStateFromOtherSequence),
 diff --git a/llama/addon/AddonContext.h b/llama/addon/AddonContext.h
-index 6f5f193..1a76e3b 100644
+index 58dbd84..0e3e65f 100644
 --- a/llama/addon/AddonContext.h
 +++ b/llama/addon/AddonContext.h
-@@ -56,6 +56,8 @@ class AddonContext : public Napi::ObjectWrap<AddonContext> {
+@@ -63,6 +63,8 @@ class AddonContext : public Napi::ObjectWrap<AddonContext> {
  
          Napi::Value SaveSequenceStateToFile(const Napi::CallbackInfo& info);
          Napi::Value LoadSequenceStateFromFile(const Napi::CallbackInfo& info);
@@ -156,10 +156,10 @@ index 6f5f193..1a76e3b 100644
          Napi::Value PrintTimings(const Napi::CallbackInfo& info);
          Napi::Value EnsureDraftContextIsCompatibleForSpeculative(const Napi::CallbackInfo& info);
 diff --git a/src/bindings/AddonTypes.ts b/src/bindings/AddonTypes.ts
-index 63a879e..a7f317c 100644
+index d7aaeee..1bc2ab7 100644
 --- a/src/bindings/AddonTypes.ts
 +++ b/src/bindings/AddonTypes.ts
-@@ -192,6 +192,8 @@ export type AddonContext = {
+@@ -215,6 +215,8 @@ export type AddonContext = {
      ensureDraftContextIsCompatibleForSpeculative(draftContext: AddonContext): void,
      saveSequenceStateToFile(filePath: string, sequenceId: number, tokens: Uint32Array): Promise<number>,
      loadSequenceStateFromFile(filePath: string, sequenceId: number, maxContextSize: number): Promise<Uint32Array>,
@@ -167,12 +167,12 @@ index 63a879e..a7f317c 100644
 +    loadSequenceStateFromBuffer(buffer: Buffer, sequenceId: number): Promise<void>,
      setLoras(loras: AddonModelLora[], scales: number[]): void,
  
-     restoreCheckpoint(checkpoint: AddonContextSequenceCheckpoint, maxPosIndex: number): Promise<boolean>
+     restoreCheckpoint(checkpoint: AddonContextSequenceCheckpoint, maxPosIndex: number, sequenceId: number): Promise<boolean>,
 diff --git a/src/evaluator/LlamaContext/LlamaContext.ts b/src/evaluator/LlamaContext/LlamaContext.ts
-index cde9735..f3b2ecd 100644
+index 28cd906..65af87c 100644
 --- a/src/evaluator/LlamaContext/LlamaContext.ts
 +++ b/src/evaluator/LlamaContext/LlamaContext.ts
-@@ -1897,6 +1897,80 @@ export class LlamaContextSequence {
+@@ -1979,6 +1979,80 @@ export class LlamaContextSequence {
          }
      }
  

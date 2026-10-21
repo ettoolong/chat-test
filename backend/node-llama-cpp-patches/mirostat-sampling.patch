@@ -1,8 +1,8 @@
 diff --git a/llama/addon/AddonSampler.cpp b/llama/addon/AddonSampler.cpp
-index cfea8fa..872887d 100644
+index 2286095..4095f34 100644
 --- a/llama/addon/AddonSampler.cpp
 +++ b/llama/addon/AddonSampler.cpp
-@@ -58,6 +58,11 @@ void AddonSampler::dispose() {
+@@ -59,6 +59,11 @@ void AddonSampler::dispose() {
          topPSampler = nullptr;
      }
  
@@ -14,7 +14,7 @@ index cfea8fa..872887d 100644
      if (seedSampler != nullptr) {
          llama_sampler_free(seedSampler);
          seedSampler = nullptr;
-@@ -128,6 +133,15 @@ void AddonSampler::rebuildChainIfNeeded() {
+@@ -129,6 +134,15 @@ void AddonSampler::rebuildChainIfNeeded() {
          }
  
          llama_sampler_chain_add(chain, greedySampler);
@@ -30,8 +30,8 @@ index cfea8fa..872887d 100644
      } else {
          if (topKSampler != nullptr) {
              llama_sampler_chain_add(chain, topKSampler);
-@@ -376,6 +390,50 @@ Napi::Value AddonSampler::ApplyConfig(const Napi::CallbackInfo& info) {
-         topPSampler = nullptr;
+@@ -392,6 +406,50 @@ Napi::Value AddonSampler::ApplyConfig(const Napi::CallbackInfo& info) {
+         topPSampler_topP = 1.0f;
      }
  
 +    if (config.Has("mirostat")) {
@@ -78,16 +78,16 @@ index cfea8fa..872887d 100644
 +        mirostatSampler_version = 0;
 +    }
 +
+     bool seedChanged = false;
      if (config.Has("seed")) {
          auto seed = config.Get("seed").As<Napi::Number>().Uint32Value();
-         if (seed != seedSampler_seed || seedSampler == nullptr) {
 diff --git a/llama/addon/AddonSampler.h b/llama/addon/AddonSampler.h
-index 77735d0..8a07607 100644
+index a5fdfbe..ca20f93 100644
 --- a/llama/addon/AddonSampler.h
 +++ b/llama/addon/AddonSampler.h
-@@ -26,6 +26,11 @@ class AddonSampler : public Napi::ObjectWrap<AddonSampler> {
+@@ -27,6 +27,11 @@ class AddonSampler : public Napi::ObjectWrap<AddonSampler> {
          llama_sampler * topPSampler = nullptr;
-         float topPSampler_topP = 0.0f; // Top p sampling >=1.0 = disabled
+         float topPSampler_topP = 1.0f; // Top p sampling >=1.0 = disabled
  
 +        llama_sampler * mirostatSampler = nullptr;
 +        int32_t mirostatSampler_version = 0; // 0 = disabled, 1 = mirostat, 2 = mirostat v2
@@ -98,10 +98,10 @@ index 77735d0..8a07607 100644
          float xtcSampler_probability = 0;
          float xtcSampler_threshold = 0;
 diff --git a/src/bindings/AddonTypes.ts b/src/bindings/AddonTypes.ts
-index a7f317c..ea9bd63 100644
+index 1bc2ab7..bde545e 100644
 --- a/src/bindings/AddonTypes.ts
 +++ b/src/bindings/AddonTypes.ts
-@@ -227,6 +227,9 @@ export type AddonSampler = {
+@@ -255,6 +255,9 @@ export type AddonSampler = {
          minP?: number,
          topK?: number,
          topP?: number,
@@ -112,10 +112,10 @@ index a7f317c..ea9bd63 100644
          xtcProbability?: number,
          xtcThreshold?: number,
 diff --git a/src/evaluator/LlamaChat/LlamaChat.ts b/src/evaluator/LlamaChat/LlamaChat.ts
-index affbb32..3c3bbb7 100644
+index 7ab3a43..3354174 100644
 --- a/src/evaluator/LlamaChat/LlamaChat.ts
 +++ b/src/evaluator/LlamaChat/LlamaChat.ts
-@@ -236,6 +236,34 @@ export type LLamaChatGenerateResponseOptions<Functions extends ChatModelFunction
+@@ -242,6 +242,34 @@ export type LLamaChatGenerateResponseOptions<Functions extends ChatModelFunction
       */
      topP?: number,
  
@@ -150,7 +150,7 @@ index affbb32..3c3bbb7 100644
      /**
       * Used to control the randomness of the generated text.
       *
-@@ -619,6 +647,9 @@ export class LlamaChat {
+@@ -674,6 +702,9 @@ export class LlamaChat {
              minP,
              topK,
              topP,
@@ -160,7 +160,7 @@ index affbb32..3c3bbb7 100644
              seed,
              xtc,
              grammar,
-@@ -660,6 +691,9 @@ export class LlamaChat {
+@@ -715,6 +746,9 @@ export class LlamaChat {
                  minP,
                  topK,
                  topP,
@@ -170,7 +170,7 @@ index affbb32..3c3bbb7 100644
                  seed,
                  xtc,
                  grammar: grammar as undefined, // this is a workaround to allow passing both `functions` and `grammar`
-@@ -1711,6 +1745,9 @@ class GenerateResponseState<const Functions extends ChatModelFunctions | undefin
+@@ -1859,6 +1893,9 @@ class GenerateResponseState<const Functions extends ChatModelFunctions | undefin
      private readonly minP: LLamaChatGenerateResponseOptions<Functions>["minP"];
      private readonly topK: LLamaChatGenerateResponseOptions<Functions>["topK"];
      private readonly topP: LLamaChatGenerateResponseOptions<Functions>["topP"];
@@ -180,7 +180,7 @@ index affbb32..3c3bbb7 100644
      private readonly seed: LLamaChatGenerateResponseOptions<Functions>["seed"];
      private readonly xtc: LLamaChatGenerateResponseOptions<Functions>["xtc"];
      public readonly grammar: LLamaChatGenerateResponseOptions<Functions>["grammar"];
-@@ -1830,6 +1867,9 @@ class GenerateResponseState<const Functions extends ChatModelFunctions | undefin
+@@ -1978,6 +2015,9 @@ class GenerateResponseState<const Functions extends ChatModelFunctions | undefin
              minP,
              topK,
              topP,
@@ -190,7 +190,7 @@ index affbb32..3c3bbb7 100644
              seed,
              xtc,
              grammar,
-@@ -1867,6 +1907,9 @@ class GenerateResponseState<const Functions extends ChatModelFunctions | undefin
+@@ -2015,6 +2055,9 @@ class GenerateResponseState<const Functions extends ChatModelFunctions | undefin
          this.minP = minP;
          this.topK = topK;
          this.topP = topP;
@@ -200,7 +200,7 @@ index affbb32..3c3bbb7 100644
          this.seed = seed;
          this.xtc = xtc;
          this.grammar = grammar;
-@@ -3253,6 +3296,9 @@ class GenerateResponseState<const Functions extends ChatModelFunctions | undefin
+@@ -3483,6 +3526,9 @@ class GenerateResponseState<const Functions extends ChatModelFunctions | undefin
              minP: this.minP,
              topK: this.topK,
              topP: this.topP,
@@ -211,10 +211,10 @@ index affbb32..3c3bbb7 100644
              xtc: this.xtc,
              grammarEvaluationState: () => {
 diff --git a/src/evaluator/LlamaChatSession/LlamaChatSession.ts b/src/evaluator/LlamaChatSession/LlamaChatSession.ts
-index 6001d6b..081b82f 100644
+index 0c91892..de50f1e 100644
 --- a/src/evaluator/LlamaChatSession/LlamaChatSession.ts
 +++ b/src/evaluator/LlamaChatSession/LlamaChatSession.ts
-@@ -162,6 +162,34 @@ export type LLamaChatPromptOptions<Functions extends ChatSessionModelFunctions |
+@@ -163,6 +163,34 @@ export type LLamaChatPromptOptions<Functions extends ChatSessionModelFunctions |
       */
      topP?: number,
  
@@ -249,7 +249,7 @@ index 6001d6b..081b82f 100644
      /**
       * Used to control the randomness of the generated text.
       *
-@@ -635,6 +663,9 @@ export class LlamaChatSession {
+@@ -669,6 +697,9 @@ export class LlamaChatSession {
              minP,
              topK,
              topP,
@@ -259,7 +259,7 @@ index 6001d6b..081b82f 100644
              seed,
              xtc,
              grammar,
-@@ -655,7 +686,7 @@ export class LlamaChatSession {
+@@ -689,7 +720,7 @@ export class LlamaChatSession {
              onFunctionCallParamsChunk: onFunctionCallParamsChunk as undefined,
  
              onTextChunk, onToken, onResponseChunk, budgets, signal, stopOnAbortSignal, maxTokens,
@@ -268,7 +268,7 @@ index 6001d6b..081b82f 100644
              trimWhitespaceSuffix, responsePrefix, repeatPenalty, dryRepeatPenalty, tokenBias, customStopTriggers
          });
  
-@@ -682,6 +713,9 @@ export class LlamaChatSession {
+@@ -716,6 +747,9 @@ export class LlamaChatSession {
          minP,
          topK,
          topP,
@@ -278,7 +278,7 @@ index 6001d6b..081b82f 100644
          seed,
          xtc,
          grammar,
-@@ -789,6 +823,9 @@ export class LlamaChatSession {
+@@ -823,6 +857,9 @@ export class LlamaChatSession {
                          minP,
                          topK,
                          topP,
@@ -289,10 +289,10 @@ index 6001d6b..081b82f 100644
                          xtc,
                          tokenBias,
 diff --git a/src/evaluator/LlamaContext/LlamaContext.ts b/src/evaluator/LlamaContext/LlamaContext.ts
-index f3b2ecd..cbf6d26 100644
+index 65af87c..0054d9b 100644
 --- a/src/evaluator/LlamaContext/LlamaContext.ts
 +++ b/src/evaluator/LlamaContext/LlamaContext.ts
-@@ -1537,6 +1537,9 @@ export class LlamaContextSequence {
+@@ -1580,6 +1580,9 @@ export class LlamaContextSequence {
              minP = 0,
              topK = 40,
              topP = 0.95,
@@ -302,7 +302,7 @@ index f3b2ecd..cbf6d26 100644
              seed,
              xtc,
              grammarEvaluationState,
-@@ -1579,6 +1582,9 @@ export class LlamaContextSequence {
+@@ -1622,6 +1625,9 @@ export class LlamaContextSequence {
              minP,
              topK,
              topP,
@@ -312,7 +312,7 @@ index f3b2ecd..cbf6d26 100644
              seed,
              xtc,
              grammarEvaluationState,
-@@ -2122,6 +2128,9 @@ export class LlamaContextSequence {
+@@ -2236,6 +2242,9 @@ export class LlamaContextSequence {
          minP,
          topK,
          topP,
@@ -322,7 +322,7 @@ index f3b2ecd..cbf6d26 100644
          seed,
          xtc,
          grammarEvaluationState,
-@@ -2136,7 +2145,9 @@ export class LlamaContextSequence {
+@@ -2250,7 +2259,9 @@ export class LlamaContextSequence {
          _noSampling = false,
          _skipLock = false
      }: {
@@ -333,7 +333,7 @@ index f3b2ecd..cbf6d26 100644
          grammarEvaluationState?: LlamaGrammarEvaluationState | (() => LlamaGrammarEvaluationState | undefined),
          repeatPenalty?: LlamaContextSequenceRepeatPenalty, dryRepeatPenalty?: LlamaContextSequenceDryRepeatPenalty,
          tokenBias?: TokenBias | (() => TokenBias),
-@@ -2189,6 +2200,9 @@ export class LlamaContextSequence {
+@@ -2303,6 +2314,9 @@ export class LlamaContextSequence {
                                  minP,
                                  topK,
                                  topP,
@@ -343,7 +343,7 @@ index f3b2ecd..cbf6d26 100644
                                  seed,
                                  xtc,
                                  grammarEvaluationState,
-@@ -2572,6 +2586,9 @@ export class LlamaContextSequence {
+@@ -2686,6 +2700,9 @@ export class LlamaContextSequence {
          minP = 0,
          topK = 40,
          topP = 0.95,
@@ -353,7 +353,7 @@ index f3b2ecd..cbf6d26 100644
          seed,
          xtc,
          grammarEvaluationState,
-@@ -2579,7 +2596,9 @@ export class LlamaContextSequence {
+@@ -2693,7 +2710,9 @@ export class LlamaContextSequence {
          dryRepeatPenalty,
          tokenBias
      }: {
@@ -364,7 +364,7 @@ index f3b2ecd..cbf6d26 100644
          grammarEvaluationState?: LlamaGrammarEvaluationState | (() => LlamaGrammarEvaluationState | undefined),
          repeatPenalty?: LlamaContextSequenceRepeatPenalty, dryRepeatPenalty?: LlamaContextSequenceDryRepeatPenalty,
          tokenBias?: TokenBias | (() => TokenBias)
-@@ -2607,6 +2626,9 @@ export class LlamaContextSequence {
+@@ -2721,6 +2740,9 @@ export class LlamaContextSequence {
              minP,
              topK,
              topP,
@@ -375,7 +375,7 @@ index f3b2ecd..cbf6d26 100644
                  0,
                  Number.isFinite(seed)
 diff --git a/src/evaluator/LlamaContext/types.ts b/src/evaluator/LlamaContext/types.ts
-index 23480cf..8d5ddb7 100644
+index adcaf16..6c3121d 100644
 --- a/src/evaluator/LlamaContext/types.ts
 +++ b/src/evaluator/LlamaContext/types.ts
 @@ -378,6 +378,34 @@ export type ContextTokensDeleteRange = {

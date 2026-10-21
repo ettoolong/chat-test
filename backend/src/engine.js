@@ -38,11 +38,17 @@ function modelFileFingerprint() {
 }
 
 function computeCacheKey() {
+    // The llama.cpp release is part of the key because the serialized sequence state
+    // format isn't guaranteed stable across llama.cpp builds - upgrading node-llama-cpp
+    // (and with it llama.cpp) must regenerate the cache rather than load a stale blob.
+    const { repo, release } = llama.llamaCppRelease;
     return crypto
         .createHash("sha256")
         .update(path.basename(config.modelPath))
         .update("\0")
         .update(modelFileFingerprint())
+        .update("\0")
+        .update(`${repo}@${release}`)
         .update("\0")
         .update(systemPrompt)
         .digest("hex");

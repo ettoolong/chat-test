@@ -22,11 +22,13 @@ const patchFiles = [
 ];
 
 const NODE_LLAMA_CPP_REPO = "https://github.com/withcatai/node-llama-cpp.git";
-const NODE_LLAMA_CPP_TAG = "v3.19.1";
-// Pinned to the exact llama.cpp release that node-llama-cpp@3.19.1 ships prebuilt
-// binaries for. "latest" will drift and can break the addon build (llama.cpp's C API
-// shifts between releases) - this bit us once already, keep it pinned.
-const LLAMA_CPP_RELEASE = "b10068";
+const NODE_LLAMA_CPP_TAG = "v3.22.2";
+// Pinned to the exact llama.cpp release that node-llama-cpp@3.22.2 ships prebuilt
+// binaries for (see bins/*/_nlcBuildMetadata.json in its @node-llama-cpp/* binary
+// packages). "latest" will drift and can break the addon build (llama.cpp's C API
+// shifts between releases) - this bit us once already, keep it pinned. llama.cpp moved
+// from bNNNNN build tags to semver tags (v0.x.y) around this release.
+const LLAMA_CPP_RELEASE = "v0.7.0";
 const GPU_OPTION = process.env.NLC_GPU || "auto";
 
 function run(command, args, options = {}) {
